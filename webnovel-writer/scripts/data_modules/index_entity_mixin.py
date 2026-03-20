@@ -328,6 +328,12 @@ class IndexEntityMixin:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute(
+                "SELECT 1 FROM entities WHERE id = ? LIMIT 1",
+                (change.entity_id,),
+            )
+            if cursor.fetchone() is None:
+                return 0
+            cursor.execute(
                 """
                 INSERT INTO state_changes
                 (entity_id, field, old_value, new_value, reason, chapter)
@@ -399,6 +405,13 @@ class IndexEntityMixin:
         """
         with self._get_conn() as conn:
             cursor = conn.cursor()
+
+            cursor.execute("SELECT 1 FROM entities WHERE id = ? LIMIT 1", (rel.from_entity,))
+            if cursor.fetchone() is None:
+                return False
+            cursor.execute("SELECT 1 FROM entities WHERE id = ? LIMIT 1", (rel.to_entity,))
+            if cursor.fetchone() is None:
+                return False
 
             # 检查是否存在
             cursor.execute(
@@ -574,6 +587,12 @@ class IndexEntityMixin:
 
         with self._get_conn() as conn:
             cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM entities WHERE id = ? LIMIT 1", (from_entity,))
+            if cursor.fetchone() is None:
+                return 0
+            cursor.execute("SELECT 1 FROM entities WHERE id = ? LIMIT 1", (to_entity,))
+            if cursor.fetchone() is None:
+                return 0
             cursor.execute(
                 """
                 INSERT INTO relationship_events

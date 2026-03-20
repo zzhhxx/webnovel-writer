@@ -61,6 +61,9 @@ def test_sql_state_manager_state_changes_and_relationships(temp_project):
     manager.upsert_entity(
         EntityData(id="xiaoyan", type="角色", name="萧炎", current={})
     )
+    manager.upsert_entity(
+        EntityData(id="yaolao", type="角色", name="药老", current={})
+    )
     change_id = manager.record_state_change(
         entity_id="xiaoyan",
         field="realm",
@@ -90,6 +93,9 @@ def test_sql_state_manager_state_changes_and_relationships(temp_project):
 
 def test_sql_state_manager_process_chapter_entities_and_exports(temp_project):
     manager = SQLStateManager(temp_project)
+    manager.upsert_entity(
+        EntityData(id="xiaoyan", type="角色", name="萧炎", tier="核心", current={})
+    )
     stats = manager.process_chapter_entities(
         chapter=10,
         entities_appeared=[{"id": "xiaoyan", "mentions": ["萧炎"], "confidence": 0.9}],
@@ -119,6 +125,9 @@ def test_sql_state_manager_existing_entity_updates_and_stats(temp_project):
     manager = SQLStateManager(temp_project)
     manager.upsert_entity(
         EntityData(id="xiaoyan", type="角色", name="萧炎", current={"hp": 5})
+    )
+    manager.upsert_entity(
+        EntityData(id="yaolao", type="角色", name="药老", current={})
     )
 
     stats = manager.process_chapter_entities(
@@ -163,8 +172,54 @@ def test_sql_state_manager_process_chapter_skips_and_existing(temp_project):
     assert stats["relationships"] == 0
 
 
+def test_sql_state_manager_process_chapter_is_atomic_on_exception(temp_project, monkeypatch):
+    manager = SQLStateManager(temp_project)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("injected relationship event error")
+
+    monkeypatch.setattr(manager, "_record_relationship_event_tx", _boom)
+
+    with pytest.raises(RuntimeError):
+        manager.process_chapter_entities(
+            chapter=8,
+            entities_appeared=[],
+            entities_new=[
+                {"suggested_id": "xiaoyan", "name": "萧炎", "type": "角色"},
+                {"suggested_id": "yaolao", "name": "药老", "type": "角色"},
+            ],
+            state_changes=[],
+            relationships_new=[
+                {"from": "xiaoyan", "to": "yaolao", "type": "师徒", "description": "收徒"}
+            ],
+        )
+
+    # 事务回滚：不应留下半写入实体
+    assert manager.get_entity("xiaoyan") is None
+    assert manager.get_entity("yaolao") is None
+
+
+def test_sql_state_manager_process_chapter_prevents_orphan_records(temp_project):
+    manager = SQLStateManager(temp_project)
+    stats = manager.process_chapter_entities(
+        chapter=5,
+        entities_appeared=[{"id": "ghost", "mentions": ["幽灵"], "confidence": 0.9}],
+        entities_new=[],
+        state_changes=[{"entity_id": "ghost", "field": "hp", "old": 1, "new": 2, "reason": "测试"}],
+        relationships_new=[{"from": "ghost", "to": "ghost2", "type": "相识", "description": "不存在实体"}],
+    )
+    assert stats["entities_updated"] == 0
+    assert stats["state_changes"] == 0
+    assert stats["relationships"] == 0
+    assert manager._index_manager.get_entity_appearances("ghost") == []
+    assert manager.get_entity_state_changes("ghost") == []
+    assert manager.get_entity_relationships("ghost", direction="both") == []
+
+
 def test_sql_state_manager_export_protagonist_and_cli(temp_project, monkeypatch, capsys):
     manager = SQLStateManager(temp_project)
+    temp_project.state_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_project.state_file.write_text("{}", encoding="utf-8")
 
     def run_cli(args):
         monkeypatch.setattr(sys, "argv", args)

@@ -125,6 +125,9 @@ def test_migrate_state_verbose_and_dry_run(temp_project, capsys):
 
 def test_migrate_state_cli_main(tmp_path, monkeypatch, capsys):
     project_root = tmp_path
+    webnovel = project_root / ".webnovel"
+    webnovel.mkdir(parents=True, exist_ok=True)
+    (webnovel / "state.json").write_text("{}", encoding="utf-8")
     args = [
         "migrate_state_to_sqlite",
         "--project-root",

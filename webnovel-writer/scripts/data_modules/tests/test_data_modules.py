@@ -398,6 +398,27 @@ class TestIndexManager:
     def test_record_appearance(self, temp_project):
         manager = IndexManager(temp_project)
 
+        manager.upsert_entity(
+            EntityMeta(
+                id="xiaoyan",
+                type="角色",
+                canonical_name="萧炎",
+                first_appearance=100,
+                last_appearance=100,
+                current={},
+            )
+        )
+        manager.upsert_entity(
+            EntityMeta(
+                id="yaolao",
+                type="角色",
+                canonical_name="药老",
+                first_appearance=100,
+                last_appearance=100,
+                current={},
+            )
+        )
+
         manager.record_appearance("xiaoyan", 100, ["萧炎", "他"], 0.95)
         manager.record_appearance("yaolao", 100, ["药老"], 0.92)
 
@@ -950,6 +971,8 @@ class TestIndexManager:
     def test_index_manager_cli(self, temp_project, monkeypatch, capsys):
         root = str(temp_project.project_root)
         manager = IndexManager(temp_project)
+        temp_project.state_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_project.state_file.write_text("{}", encoding="utf-8")
 
         # 基础数据
         manager.upsert_entity(

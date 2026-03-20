@@ -50,6 +50,10 @@ from .index_debt_mixin import IndexDebtMixin
 from .index_reading_mixin import IndexReadingMixin
 from .index_observability_mixin import IndexObservabilityMixin
 from .observability import safe_append_perf_timing, safe_log_tool_call
+try:
+    from security_utils import atomic_write_json, read_json_safe
+except ImportError:  # pragma: no cover
+    from scripts.security_utils import atomic_write_json, read_json_safe
 
 
 @dataclass
@@ -918,6 +922,76 @@ def main():
         )
         _append_timing(False, error_code=code, error_message=message, chapter=chapter)
 
+    def _resolve_review_report_path(report_file: str) -> str:
+        raw = str(report_file or "").strip()
+        if not raw:
+            raise ValueError("report_file 不能为空")
+
+        root = manager.config.project_root.resolve()
+        input_path = Path(raw)
+        candidates: list[Path] = []
+        if input_path.is_absolute():
+            candidates.append(input_path)
+        else:
+            candidates.extend(
+                [
+                    root / input_path,
+                    root / ".webnovel" / "reports" / input_path,
+                    root / "审查报告" / input_path,
+                ]
+            )
+
+        deduped: list[Path] = []
+        seen = set()
+        for p in candidates:
+            key = str(p.resolve()) if p.exists() else str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(p)
+
+        for candidate in deduped:
+            if candidate.is_file():
+                resolved = candidate.resolve()
+                try:
+                    rel = resolved.relative_to(root)
+                    return str(rel).replace("\\", "/")
+                except ValueError:
+                    return str(resolved).replace("\\", "/")
+
+        raise FileNotFoundError(f"审查报告文件不存在: {raw}")
+
+    def _upsert_review_checkpoint_state(start_chapter: int, end_chapter: int, report_file: str) -> None:
+        state_path = manager.config.state_file
+        state = read_json_safe(state_path, default={})
+        if not isinstance(state, dict):
+            state = {}
+
+        checkpoints = state.get("review_checkpoints")
+        if not isinstance(checkpoints, list):
+            checkpoints = []
+            state["review_checkpoints"] = checkpoints
+
+        chapters_key = f"{int(start_chapter)}-{int(end_chapter)}"
+        reviewed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for item in checkpoints:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("chapters", "")).strip() == chapters_key:
+                item["report"] = report_file
+                item["reviewed_at"] = reviewed_at
+                break
+        else:
+            checkpoints.append(
+                {
+                    "chapters": chapters_key,
+                    "report": report_file,
+                    "reviewed_at": reviewed_at,
+                }
+            )
+
+        atomic_write_json(state_path, state, use_lock=True, backup=True)
+
     if args.command == "stats":
         emit_success(manager.get_stats(), message="stats")
 
@@ -1136,6 +1210,16 @@ def main():
 
     elif args.command == "save-review-metrics":
         data = load_json_arg(args.data)
+        report_file = str(data.get("report_file", "") or "").strip()
+        if not report_file:
+            emit_error("MISSING_REPORT_FILE", "save-review-metrics 需要 report_file 字段")
+            return
+        try:
+            report_file = _resolve_review_report_path(report_file)
+        except (ValueError, FileNotFoundError) as exc:
+            emit_error("INVALID_REPORT_FILE", str(exc))
+            return
+
         metrics = ReviewMetrics(
             start_chapter=data["start_chapter"],
             end_chapter=data["end_chapter"],
@@ -1143,10 +1227,31 @@ def main():
             dimension_scores=data.get("dimension_scores", {}),
             severity_counts=data.get("severity_counts", {}),
             critical_issues=data.get("critical_issues", []),
-            report_file=data.get("report_file", ""),
+            report_file=report_file,
             notes=data.get("notes", ""),
         )
-        manager.save_review_metrics(metrics)
+        state_snapshot = read_json_safe(manager.config.state_file, default={})
+        if not isinstance(state_snapshot, dict):
+            state_snapshot = {}
+        try:
+            _upsert_review_checkpoint_state(
+                metrics.start_chapter, metrics.end_chapter, metrics.report_file
+            )
+            manager.save_review_metrics(metrics)
+        except Exception as exc:
+            rollback_error: Optional[Exception] = None
+            try:
+                atomic_write_json(manager.config.state_file, state_snapshot, use_lock=True, backup=True)
+            except Exception as rollback_exc:
+                rollback_error = rollback_exc
+            if rollback_error is not None:
+                emit_error(
+                    "REVIEW_SYNC_FAILED",
+                    f"保存审查指标失败: {exc}; 且 state 回滚失败: {rollback_error}",
+                )
+            else:
+                emit_error("REVIEW_SYNC_FAILED", f"保存审查指标失败: {exc}")
+            return
         emit_success(
             {"start_chapter": metrics.start_chapter, "end_chapter": metrics.end_chapter},
             message="review_metrics_saved",

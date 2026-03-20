@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import AsyncGenerator
 
 from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler, FileModifiedEvent, FileCreatedEvent
+from watchdog.events import FileSystemEventHandler
 
 
 class _WebnovelFileHandler(FileSystemEventHandler):
@@ -20,21 +20,60 @@ class _WebnovelFileHandler(FileSystemEventHandler):
 
     WATCH_NAMES = {"state.json", "index.db", "workflow_state.json"}
 
-    def __init__(self, notify_callback):
+    def __init__(self, notify_callback, watch_root: Path, extra_roots: list[Path] | None = None):
         super().__init__()
         self._notify = notify_callback
+        self._watch_root = watch_root.resolve()
+        self._reports_root = (watch_root / "reports").resolve()
+        self._extra_roots = [
+            Path(root).resolve()
+            for root in (extra_roots or [])
+        ]
+
+    @staticmethod
+    def _is_under(path: Path, root: Path) -> bool:
+        try:
+            path.resolve().relative_to(root.resolve())
+            return True
+        except ValueError:
+            return False
+
+    def _should_notify(self, file_path: Path) -> bool:
+        name = file_path.name
+        if name in self.WATCH_NAMES:
+            return True
+
+        resolved = file_path.resolve()
+        # 递归监听 reports 目录，覆盖审查报告/趋势报告等文件变更
+        if self._is_under(resolved, self._reports_root):
+            return True
+
+        for root in self._extra_roots:
+            if self._is_under(resolved, root):
+                return True
+
+        return False
 
     def on_modified(self, event):
         if event.is_directory:
             return
-        if Path(event.src_path).name in self.WATCH_NAMES:
+        path = Path(event.src_path)
+        if self._should_notify(path):
             self._notify(event.src_path, "modified")
 
     def on_created(self, event):
         if event.is_directory:
             return
-        if Path(event.src_path).name in self.WATCH_NAMES:
+        path = Path(event.src_path)
+        if self._should_notify(path):
             self._notify(event.src_path, "created")
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        dest = Path(getattr(event, "dest_path", "") or "")
+        if dest and self._should_notify(dest):
+            self._notify(str(dest), "moved")
 
 
 class FileWatcher:
@@ -78,12 +117,38 @@ class FileWatcher:
 
     # --- 生命周期 ---
 
-    def start(self, watch_dir: Path, loop: asyncio.AbstractEventLoop):
-        """启动 watchdog observer，监听 watch_dir。"""
+    def start(
+        self,
+        watch_dir: Path,
+        loop: asyncio.AbstractEventLoop,
+        extra_watch_dirs: list[Path] | None = None,
+    ):
+        """启动 watchdog observer，监听 watch_dir 以及可选扩展目录。"""
         self._loop = loop
-        handler = _WebnovelFileHandler(self._on_change)
+        if self._observer:
+            self.stop()
+
+        watch_dir = watch_dir.resolve()
+        extras = [Path(p).resolve() for p in (extra_watch_dirs or [])]
+        handler = _WebnovelFileHandler(self._on_change, watch_dir, extras)
         self._observer = Observer()
-        self._observer.schedule(handler, str(watch_dir), recursive=False)
+        self._observer.schedule(handler, str(watch_dir), recursive=True)
+
+        scheduled = {str(watch_dir)}
+        for extra in extras:
+            if not extra.is_dir():
+                continue
+            try:
+                extra.relative_to(watch_dir)
+                continue
+            except ValueError:
+                pass
+            key = str(extra)
+            if key in scheduled:
+                continue
+            self._observer.schedule(handler, key, recursive=True)
+            scheduled.add(key)
+
         self._observer.daemon = True
         self._observer.start()
 

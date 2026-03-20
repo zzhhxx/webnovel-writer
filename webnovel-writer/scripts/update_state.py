@@ -48,6 +48,7 @@ import os
 import sys
 import argparse
 import shutil
+import re
 from pathlib import Path
 
 from runtime_compat import enable_windows_utf8_stdio
@@ -76,6 +77,8 @@ class StateUpdater:
         self.dry_run = dry_run
         self.backup_file = None
         self.state = None
+        self.project_root = Path(state_file).resolve().parent.parent
+        self._pending_review_metrics: Optional[Dict[str, Any]] = None
 
     def _validate_schema(self, state: Dict) -> bool:
         """验证 state.json 的基本结构（v5.0 引入，v5.4 沿用）"""
@@ -143,7 +146,8 @@ class StateUpdater:
             return False
 
         try:
-            with open(self.state_file, 'r', encoding='utf-8') as f:
+            # 兼容 UTF-8 BOM（utf-8-sig 可同时读取普通 UTF-8）
+            with open(self.state_file, 'r', encoding='utf-8-sig') as f:
                 self.state = json.load(f)
 
             if not self._validate_schema(self.state):
@@ -329,17 +333,138 @@ class StateUpdater:
         })
         print(f"📝 标记第{volume}卷已规划: 第{chapters_range}章")
 
-    def add_review_checkpoint(self, chapters_range: str, report_file: str):
-        """添加审查记录"""
-        if "review_checkpoints" not in self.state:
-            self.state["review_checkpoints"] = []
+    def _parse_chapters_range(self, chapters_range: str) -> tuple[int, int]:
+        """解析章节范围，支持 1-2 / 1—2 / 第1-2章 / 单章。"""
+        text = str(chapters_range or "").strip()
+        if not text:
+            raise ValueError("章节范围不能为空")
 
-        self.state["review_checkpoints"].append({
-            "chapters": chapters_range,
-            "report": report_file,
-            "reviewed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        })
-        print(f"📝 添加审查记录: 第{chapters_range}章 → {report_file}")
+        normalized = text.replace("—", "-").replace("–", "-").replace("至", "-").replace("到", "-")
+        m = re.search(r"(\d+)\s*-\s*(\d+)", normalized)
+        if m:
+            start = int(m.group(1))
+            end = int(m.group(2))
+        else:
+            m_single = re.search(r"(\d+)", normalized)
+            if not m_single:
+                raise ValueError(f"无法解析章节范围: {chapters_range}")
+            start = end = int(m_single.group(1))
+
+        if start <= 0 or end <= 0:
+            raise ValueError(f"章节号必须大于 0: {chapters_range}")
+        if start > end:
+            start, end = end, start
+        return start, end
+
+    def _resolve_report_file(self, report_file: str) -> tuple[Path, str]:
+        """解析并校验审查报告文件路径，返回 (绝对路径, 项目相对路径)。"""
+        raw = str(report_file or "").strip()
+        if not raw:
+            raise ValueError("report_file 不能为空")
+
+        input_path = Path(raw)
+        candidates: list[Path] = []
+        if input_path.is_absolute():
+            candidates.append(input_path)
+        else:
+            candidates.extend(
+                [
+                    self.project_root / input_path,
+                    self.project_root / ".webnovel" / "reports" / input_path,
+                    self.project_root / "审查报告" / input_path,
+                ]
+            )
+
+        deduped: list[Path] = []
+        seen = set()
+        for p in candidates:
+            key = str(p.resolve()) if p.exists() else str(p)
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(p)
+
+        for candidate in deduped:
+            if candidate.is_file():
+                resolved = candidate.resolve()
+                try:
+                    rel = resolved.relative_to(self.project_root.resolve())
+                    rel_path = str(rel).replace("\\", "/")
+                except ValueError:
+                    rel_path = str(resolved).replace("\\", "/")
+                return resolved, rel_path
+
+        tried = [str(p) for p in deduped]
+        raise FileNotFoundError(f"审查报告文件不存在: {raw} (尝试路径: {tried})")
+
+    def _upsert_review_checkpoint(self, chapters_key: str, report_path: str) -> None:
+        checkpoints = self.state.get("review_checkpoints")
+        if not isinstance(checkpoints, list):
+            checkpoints = []
+            self.state["review_checkpoints"] = checkpoints
+
+        reviewed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for item in checkpoints:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("chapters", "")).strip() == chapters_key:
+                item["report"] = report_path
+                item["reviewed_at"] = reviewed_at
+                return
+
+        checkpoints.append(
+            {
+                "chapters": chapters_key,
+                "report": report_path,
+                "reviewed_at": reviewed_at,
+            }
+        )
+
+    def add_review_checkpoint(self, chapters_range: str, report_file: str):
+        """添加审查记录（校验报告文件存在，并在保存后同步 index.db）。"""
+        start_chapter, end_chapter = self._parse_chapters_range(chapters_range)
+        _, report_rel = self._resolve_report_file(report_file)
+        chapters_key = f"{start_chapter}-{end_chapter}"
+
+        self._upsert_review_checkpoint(chapters_key, report_rel)
+        self._pending_review_metrics = {
+            "start_chapter": start_chapter,
+            "end_chapter": end_chapter,
+            "report_file": report_rel,
+        }
+        print(f"📝 添加审查记录: 第{chapters_key}章 → {report_rel}")
+
+    def sync_pending_review_metrics(self) -> bool:
+        """将 add-review 缓存同步到 index.db（确保 state/db 双写）。"""
+        if self.dry_run or not self._pending_review_metrics:
+            return True
+
+        payload = dict(self._pending_review_metrics)
+        try:
+            from data_modules.config import DataModulesConfig
+            from data_modules.index_manager import IndexManager, ReviewMetrics
+
+            cfg = DataModulesConfig.from_project_root(self.project_root)
+            manager = IndexManager(cfg)
+            metrics = ReviewMetrics(
+                start_chapter=int(payload["start_chapter"]),
+                end_chapter=int(payload["end_chapter"]),
+                overall_score=0.0,
+                dimension_scores={},
+                severity_counts={},
+                critical_issues=[],
+                report_file=str(payload["report_file"]),
+                notes="checkpoint_synced_from_update_state_add_review",
+            )
+            manager.save_review_metrics(metrics)
+            self._pending_review_metrics = None
+            print(
+                f"✅ index.db 审查指标已同步: Ch{metrics.start_chapter}-{metrics.end_chapter}"
+            )
+            return True
+        except Exception as e:
+            print(f"❌ index.db 审查指标同步失败: {e}")
+            return False
 
     def update_strand_tracker(self, strand: str, chapter: int):
         """更新主导情节线（Strand Weave系统）"""
@@ -377,7 +502,8 @@ class StateUpdater:
         # 添加到历史记录
         tracker["history"].append({
             "chapter": chapter,
-            "dominant": strand
+            "dominant": strand,
+            "strand": strand,
         })
 
         # 只保留最近50章的历史（避免文件过大）
@@ -613,6 +739,11 @@ def main():
         # 保存更新
         if not updater.save():
             sys.exit(1)
+
+        # 审查记录需要双写：state.json + index.db
+        if args.add_review and not args.dry_run:
+            if not updater.sync_pending_review_metrics():
+                raise RuntimeError("审查记录写入 index.db 失败")
 
         print("\n✅ 更新完成！")
 

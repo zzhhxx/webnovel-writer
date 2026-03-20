@@ -13,6 +13,7 @@ SQL State Manager - SQLite 状态管理模块 (v5.4)
 """
 
 import json
+import sqlite3
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -295,126 +296,433 @@ class SQLStateManager:
             "relationships": 0,
             "aliases": 0
         }
+        with self._index_manager._get_conn() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute("BEGIN")
 
-        # 1. 处理出场实体（更新 last_appearance）
-        for entity in entities_appeared:
-            entity_id = entity.get("id")
-            if not entity_id:
-                continue
+                # 1. 处理新实体（优先创建，后续可被状态变化/关系引用）
+                for entity in entities_new:
+                    suggested_id = entity.get("suggested_id") or entity.get("id")
+                    if not suggested_id:
+                        continue
 
-            self._index_manager.update_entity_current(entity_id, {})  # 触发 updated_at
-            # 更新 last_appearance
-            existing = self._index_manager.get_entity(entity_id)
-            if existing:
-                # 使用 SQL 直接更新 last_appearance
-                self._update_last_appearance(entity_id, chapter)
-                stats["entities_updated"] += 1
+                    entity_data = EntityData(
+                        id=str(suggested_id),
+                        type=str(entity.get("type", "角色")),
+                        name=str(entity.get("name", suggested_id)),
+                        tier=str(entity.get("tier", "装饰")),
+                        desc=str(entity.get("desc", "")),
+                        current=entity.get("current", {}) if isinstance(entity.get("current", {}), dict) else {},
+                        aliases=entity.get("aliases", []) if isinstance(entity.get("aliases", []), list) else [],
+                        first_appearance=chapter,
+                        last_appearance=chapter,
+                        is_protagonist=bool(entity.get("is_protagonist", False)),
+                    )
+                    is_new = self._upsert_entity_tx(cursor, entity_data)
+                    if is_new:
+                        stats["entities_created"] += 1
+                    else:
+                        stats["entities_updated"] += 1
 
-            # 记录出场（保留原有逻辑）
-            self._index_manager.record_appearance(
-                entity_id=entity_id,
-                chapter=chapter,
-                mentions=entity.get("mentions", []),
-                confidence=entity.get("confidence", 1.0)
-            )
+                    if self._register_alias_tx(cursor, entity_data.name, entity_data.id, entity_data.type):
+                        stats["aliases"] += 1
+                    for alias in entity_data.aliases:
+                        if alias and alias != entity_data.name:
+                            if self._register_alias_tx(cursor, str(alias), entity_data.id, entity_data.type):
+                                stats["aliases"] += 1
 
-        # 2. 处理新实体
-        for entity in entities_new:
-            suggested_id = entity.get("suggested_id") or entity.get("id")
-            if not suggested_id:
-                continue
+                    mentions = entity.get("mentions", [])
+                    if not isinstance(mentions, list) or not mentions:
+                        mentions = [entity_data.name]
+                    self._record_appearance_tx(
+                        cursor=cursor,
+                        entity_id=entity_data.id,
+                        chapter=chapter,
+                        mentions=mentions,
+                        confidence=entity.get("confidence", 1.0),
+                    )
 
-            entity_data = EntityData(
-                id=suggested_id,
-                type=entity.get("type", "角色"),
-                name=entity.get("name", suggested_id),
-                tier=entity.get("tier", "装饰"),
-                desc=entity.get("desc", ""),
-                current=entity.get("current", {}),
-                aliases=entity.get("aliases", []),
-                first_appearance=chapter,
-                last_appearance=chapter,
-                is_protagonist=entity.get("is_protagonist", False)
-            )
-            is_new = self.upsert_entity(entity_data)
-            if is_new:
-                stats["entities_created"] += 1
-            else:
-                stats["entities_updated"] += 1
+                # 2. 处理出场实体（仅允许已存在实体，防止孤儿记录）
+                for entity in entities_appeared:
+                    entity_id = entity.get("id")
+                    if not entity_id:
+                        continue
+                    entity_id = str(entity_id)
+                    if not self._entity_exists_tx(cursor, entity_id):
+                        continue
 
-            # 统计别名
-            stats["aliases"] += 1 + len(entity_data.aliases)
+                    self._update_last_appearance_tx(cursor, entity_id, chapter)
+                    stats["entities_updated"] += 1
+                    self._record_appearance_tx(
+                        cursor=cursor,
+                        entity_id=entity_id,
+                        chapter=chapter,
+                        mentions=entity.get("mentions", []),
+                        confidence=entity.get("confidence", 1.0),
+                    )
 
-            # 记录新实体的首次出场（解决 appearances 缺失问题）
-            mentions = entity.get("mentions", [])
-            if not mentions:
-                mentions = [entity_data.name]  # 至少包含实体名
-            self._index_manager.record_appearance(
-                entity_id=suggested_id,
-                chapter=chapter,
-                mentions=mentions,
-                confidence=entity.get("confidence", 1.0)
-            )
+                # 3. 处理状态变化（仅允许已存在实体）
+                for change in state_changes:
+                    entity_id = change.get("entity_id")
+                    if not entity_id:
+                        continue
+                    entity_id = str(entity_id)
+                    if not self._entity_exists_tx(cursor, entity_id):
+                        continue
 
-        # 3. 处理状态变化
-        for change in state_changes:
-            entity_id = change.get("entity_id")
-            if not entity_id:
-                continue
+                    change_id = self._record_state_change_tx(
+                        cursor=cursor,
+                        entity_id=entity_id,
+                        field=str(change.get("field", "")),
+                        old_value=change.get("old", change.get("old_value", "")),
+                        new_value=change.get("new", change.get("new_value", "")),
+                        reason=str(change.get("reason", "")),
+                        chapter=chapter,
+                    )
+                    if change_id > 0:
+                        stats["state_changes"] += 1
 
-            self.record_state_change(
-                entity_id=entity_id,
-                field=change.get("field", ""),
-                old_value=change.get("old", change.get("old_value", "")),
-                new_value=change.get("new", change.get("new_value", "")),
-                reason=change.get("reason", ""),
-                chapter=chapter
-            )
-            stats["state_changes"] += 1
+                    field_name = change.get("field")
+                    new_value = change.get("new", change.get("new_value"))
+                    if field_name and new_value is not None:
+                        self._update_entity_current_tx(cursor, entity_id, {str(field_name): new_value})
 
-            # 同步更新实体的 current
-            field_name = change.get("field")
-            new_value = change.get("new", change.get("new_value"))
-            # 注意：new_value 可能是 0/""/False 等 falsy 值，需要用 is not None 判断
-            if field_name and new_value is not None:
-                self._index_manager.update_entity_current(entity_id, {field_name: new_value})
+                # 4. 处理关系（仅允许两端实体都存在）
+                for rel in relationships_new:
+                    from_entity = rel.get("from", rel.get("from_entity"))
+                    to_entity = rel.get("to", rel.get("to_entity"))
+                    if not from_entity or not to_entity:
+                        continue
+                    from_entity = str(from_entity)
+                    to_entity = str(to_entity)
+                    if not self._entity_exists_tx(cursor, from_entity):
+                        continue
+                    if not self._entity_exists_tx(cursor, to_entity):
+                        continue
 
-        # 4. 处理新关系
-        for rel in relationships_new:
-            from_entity = rel.get("from", rel.get("from_entity"))
-            to_entity = rel.get("to", rel.get("to_entity"))
-            if not from_entity or not to_entity:
-                continue
-            rel_type = rel.get("type", "相识")
-            description = rel.get("description", "")
+                    rel_type = str(rel.get("type", "相识"))
+                    description = str(rel.get("description", ""))
 
-            # v5.5: 先记录关系事件，再更新关系快照
-            self._index_manager.record_relationship_event(
-                RelationshipEventMeta(
-                    from_entity=from_entity,
-                    to_entity=to_entity,
-                    type=rel_type,
-                    chapter=chapter,
-                    action=rel.get("action", "update"),
-                    polarity=rel.get("polarity", 0),
-                    strength=rel.get("strength", 0.5),
-                    description=description,
-                    scene_index=rel.get("scene_index", 0),
-                    evidence=rel.get("evidence", ""),
-                    confidence=rel.get("confidence", 1.0),
-                )
-            )
+                    self._record_relationship_event_tx(
+                        cursor=cursor,
+                        from_entity=from_entity,
+                        to_entity=to_entity,
+                        rel_type=rel_type,
+                        chapter=chapter,
+                        action=rel.get("action", "update"),
+                        polarity=rel.get("polarity", None),
+                        strength=rel.get("strength", 0.5),
+                        description=description,
+                        scene_index=rel.get("scene_index", 0),
+                        evidence=rel.get("evidence", ""),
+                        confidence=rel.get("confidence", 1.0),
+                    )
 
-            self.upsert_relationship(
-                from_entity=from_entity,
-                to_entity=to_entity,
-                type=rel_type,
-                description=description,
-                chapter=chapter
-            )
-            stats["relationships"] += 1
+                    self._upsert_relationship_tx(
+                        cursor=cursor,
+                        from_entity=from_entity,
+                        to_entity=to_entity,
+                        rel_type=rel_type,
+                        description=description,
+                        chapter=chapter,
+                    )
+                    stats["relationships"] += 1
+
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
         return stats
+
+    def _entity_exists_tx(self, cursor: sqlite3.Cursor, entity_id: str) -> bool:
+        cursor.execute("SELECT 1 FROM entities WHERE id = ? LIMIT 1", (entity_id,))
+        return cursor.fetchone() is not None
+
+    def _fetch_entity_current_tx(self, cursor: sqlite3.Cursor, entity_id: str) -> Dict[str, Any]:
+        cursor.execute("SELECT current_json FROM entities WHERE id = ?", (entity_id,))
+        row = cursor.fetchone()
+        if not row or not row["current_json"]:
+            return {}
+        try:
+            current = json.loads(row["current_json"])
+            return current if isinstance(current, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    def _upsert_entity_tx(self, cursor: sqlite3.Cursor, entity: EntityData) -> bool:
+        cursor.execute("SELECT id, current_json, first_appearance, last_appearance FROM entities WHERE id = ?", (entity.id,))
+        existing = cursor.fetchone()
+        if existing:
+            old_current = {}
+            if existing["current_json"]:
+                try:
+                    parsed = json.loads(existing["current_json"])
+                    if isinstance(parsed, dict):
+                        old_current = parsed
+                except json.JSONDecodeError:
+                    old_current = {}
+            merged_current = {**old_current, **(entity.current or {})}
+            cursor.execute(
+                """
+                UPDATE entities SET
+                    current_json = ?,
+                    last_appearance = MAX(last_appearance, ?),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(merged_current, ensure_ascii=False),
+                    int(entity.last_appearance or 0),
+                    entity.id,
+                ),
+            )
+            return False
+
+        cursor.execute(
+            """
+            INSERT INTO entities
+            (id, type, canonical_name, tier, desc, current_json,
+             first_appearance, last_appearance, is_protagonist, is_archived)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            """,
+            (
+                entity.id,
+                entity.type,
+                entity.name,
+                entity.tier,
+                entity.desc,
+                json.dumps(entity.current or {}, ensure_ascii=False),
+                int(entity.first_appearance or 0),
+                int(entity.last_appearance or 0),
+                1 if entity.is_protagonist else 0,
+            ),
+        )
+        return True
+
+    def _register_alias_tx(self, cursor: sqlite3.Cursor, alias: str, entity_id: str, entity_type: str) -> bool:
+        if not alias:
+            return False
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO aliases (alias, entity_id, entity_type)
+            VALUES (?, ?, ?)
+            """,
+            (alias, entity_id, entity_type),
+        )
+        return cursor.rowcount > 0
+
+    def _update_entity_current_tx(self, cursor: sqlite3.Cursor, entity_id: str, updates: Dict[str, Any]) -> bool:
+        if not self._entity_exists_tx(cursor, entity_id):
+            return False
+        current = self._fetch_entity_current_tx(cursor, entity_id)
+        current.update(updates or {})
+        cursor.execute(
+            """
+            UPDATE entities SET
+                current_json = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (json.dumps(current, ensure_ascii=False), entity_id),
+        )
+        return cursor.rowcount > 0
+
+    def _record_appearance_tx(
+        self,
+        cursor: sqlite3.Cursor,
+        entity_id: str,
+        chapter: int,
+        mentions: Any,
+        confidence: Any,
+    ) -> bool:
+        if not self._entity_exists_tx(cursor, entity_id):
+            return False
+        if not isinstance(mentions, list):
+            mentions = []
+        try:
+            conf = float(confidence)
+        except (TypeError, ValueError):
+            conf = 1.0
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO appearances
+            (entity_id, chapter, mentions, confidence)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                entity_id,
+                int(chapter),
+                json.dumps(mentions, ensure_ascii=False),
+                conf,
+            ),
+        )
+        return True
+
+    def _record_state_change_tx(
+        self,
+        cursor: sqlite3.Cursor,
+        entity_id: str,
+        field: str,
+        old_value: Any,
+        new_value: Any,
+        reason: str,
+        chapter: int,
+    ) -> int:
+        if not self._entity_exists_tx(cursor, entity_id):
+            return 0
+        cursor.execute(
+            """
+            INSERT INTO state_changes
+            (entity_id, field, old_value, new_value, reason, chapter)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                entity_id,
+                field,
+                str(old_value) if old_value is not None else "",
+                str(new_value) if new_value is not None else "",
+                reason,
+                int(chapter),
+            ),
+        )
+        return int(cursor.lastrowid or 0)
+
+    def _upsert_relationship_tx(
+        self,
+        cursor: sqlite3.Cursor,
+        from_entity: str,
+        to_entity: str,
+        rel_type: str,
+        description: str,
+        chapter: int,
+    ) -> bool:
+        if not self._entity_exists_tx(cursor, from_entity):
+            return False
+        if not self._entity_exists_tx(cursor, to_entity):
+            return False
+        cursor.execute(
+            """
+            SELECT id FROM relationships
+            WHERE from_entity = ? AND to_entity = ? AND type = ?
+            """,
+            (from_entity, to_entity, rel_type),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            cursor.execute(
+                """
+                UPDATE relationships SET
+                    description = ?,
+                    chapter = ?
+                WHERE id = ?
+                """,
+                (description, int(chapter), int(existing["id"])),
+            )
+            return False
+        cursor.execute(
+            """
+            INSERT INTO relationships
+            (from_entity, to_entity, type, description, chapter)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (from_entity, to_entity, rel_type, description, int(chapter)),
+        )
+        return True
+
+    def _infer_relationship_polarity(self, rel_type: str) -> int:
+        t = str(rel_type or "")
+        positive_keywords = ("盟友", "友好", "师徒", "同伴", "亲", "爱", "合作")
+        negative_keywords = ("敌", "仇", "恨", "对立", "冲突", "背叛", "追杀")
+        if any(k in t for k in negative_keywords):
+            return -1
+        if any(k in t for k in positive_keywords):
+            return 1
+        return 0
+
+    def _record_relationship_event_tx(
+        self,
+        cursor: sqlite3.Cursor,
+        from_entity: str,
+        to_entity: str,
+        rel_type: str,
+        chapter: int,
+        action: Any,
+        polarity: Any,
+        strength: Any,
+        description: Any,
+        scene_index: Any,
+        evidence: Any,
+        confidence: Any,
+    ) -> int:
+        if not self._entity_exists_tx(cursor, from_entity):
+            return 0
+        if not self._entity_exists_tx(cursor, to_entity):
+            return 0
+
+        normalized_action = str(action or "update").strip().lower()
+        if normalized_action not in {"create", "update", "decay", "remove"}:
+            normalized_action = "update"
+
+        if polarity is None:
+            normalized_polarity = self._infer_relationship_polarity(rel_type)
+        else:
+            try:
+                normalized_polarity = int(polarity)
+            except (TypeError, ValueError):
+                normalized_polarity = 0
+        normalized_polarity = max(-1, min(1, normalized_polarity))
+
+        try:
+            normalized_strength = float(strength)
+        except (TypeError, ValueError):
+            normalized_strength = 0.5
+        normalized_strength = max(0.0, min(1.0, normalized_strength))
+
+        try:
+            normalized_scene_index = int(scene_index)
+        except (TypeError, ValueError):
+            normalized_scene_index = 0
+
+        try:
+            normalized_confidence = float(confidence)
+        except (TypeError, ValueError):
+            normalized_confidence = 1.0
+        normalized_confidence = max(0.0, min(1.0, normalized_confidence))
+
+        cursor.execute(
+            """
+            INSERT INTO relationship_events
+            (from_entity, to_entity, type, action, polarity, strength, description, chapter, scene_index, evidence, confidence)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                from_entity,
+                to_entity,
+                rel_type,
+                normalized_action,
+                normalized_polarity,
+                normalized_strength,
+                str(description or ""),
+                int(chapter),
+                normalized_scene_index,
+                str(evidence or ""),
+                normalized_confidence,
+            ),
+        )
+        return int(cursor.lastrowid or 0)
+
+    def _update_last_appearance_tx(self, cursor: sqlite3.Cursor, entity_id: str, chapter: int):
+        cursor.execute(
+            """
+            UPDATE entities SET
+                last_appearance = MAX(last_appearance, ?),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (chapter, entity_id),
+        )
 
     def _update_last_appearance(self, entity_id: str, chapter: int):
         """更新实体的 last_appearance"""

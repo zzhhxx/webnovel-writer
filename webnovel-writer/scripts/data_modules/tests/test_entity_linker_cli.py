@@ -17,6 +17,8 @@ def temp_project(tmp_path):
     from data_modules.config import DataModulesConfig
     cfg = DataModulesConfig.from_project_root(tmp_path)
     cfg.ensure_dirs()
+    cfg.state_file.parent.mkdir(parents=True, exist_ok=True)
+    cfg.state_file.write_text("{}", encoding="utf-8")
     return cfg
 
 

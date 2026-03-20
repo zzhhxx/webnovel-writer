@@ -467,12 +467,18 @@ def read_json_safe(
     if not file_path.exists():
         return default
 
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"⚠️ 读取 JSON 失败 ({file_path}): {e}", file=sys.stderr)
-        return default
+    last_error: Optional[Exception] = None
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            last_error = e
+            continue
+
+    if last_error is not None:
+        print(f"⚠️ 读取 JSON 失败 ({file_path}): {last_error}", file=sys.stderr)
+    return default
 
 
 def restore_from_backup(file_path: Union[str, Path]) -> bool:

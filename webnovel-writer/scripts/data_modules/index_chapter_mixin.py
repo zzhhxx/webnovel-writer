@@ -152,6 +152,11 @@ class IndexChapterMixin:
         with self._get_conn() as conn:
             cursor = conn.cursor()
 
+            # 防止写入孤儿记录：实体不存在时直接跳过
+            cursor.execute("SELECT 1 FROM entities WHERE id = ? LIMIT 1", (entity_id,))
+            if cursor.fetchone() is None:
+                return False
+
             if skip_if_exists:
                 # 先检查是否已存在
                 cursor.execute(
@@ -159,7 +164,7 @@ class IndexChapterMixin:
                     (entity_id, chapter),
                 )
                 if cursor.fetchone():
-                    return  # 已存在，跳过
+                    return False  # 已存在，跳过
 
             cursor.execute(
                 """
@@ -175,6 +180,7 @@ class IndexChapterMixin:
                 ),
             )
             conn.commit()
+            return True
 
     def get_entity_appearances(self, entity_id: str, limit: int = None) -> List[Dict]:
         """获取实体出场记录"""

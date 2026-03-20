@@ -66,7 +66,7 @@ export default function App() {
                 {page === 'entities' && <EntitiesPage key={refreshKey} />}
                 {page === 'graph' && <GraphPage key={refreshKey} />}
                 {page === 'chapters' && <ChaptersPage key={refreshKey} />}
-                {page === 'files' && <FilesPage />}
+                {page === 'files' && <FilesPage key={refreshKey} refreshKey={refreshKey} />}
                 {page === 'reading' && <ReadingPowerPage key={refreshKey} />}
             </main>
         </div>
@@ -89,7 +89,7 @@ const FULL_DATA_GROUPS = [
     { key: 'aliases', title: '别名', columns: ['alias', 'entity_id', 'entity_type'], domain: 'core' },
     { key: 'stateChanges', title: '状态变化', columns: ['entity_id', 'field', 'old_value', 'new_value', 'chapter'], domain: 'core' },
     { key: 'relationships', title: '关系', columns: ['from_entity', 'to_entity', 'type', 'chapter', 'description'], domain: 'network' },
-    { key: 'relationshipEvents', title: '关系事件', columns: ['from_entity', 'to_entity', 'type', 'chapter', 'event_type', 'description'], domain: 'network' },
+    { key: 'relationshipEvents', title: '关系事件', columns: ['from_entity', 'to_entity', 'type', 'chapter', 'action', 'description'], domain: 'network' },
     { key: 'readingPower', title: '追读力', columns: ['chapter', 'hook_type', 'hook_strength', 'is_transition', 'override_count', 'debt_balance'], domain: 'network' },
     { key: 'overrides', title: 'Override 合约', columns: ['chapter', 'constraint_type', 'constraint_id', 'due_chapter', 'status'], domain: 'network' },
     { key: 'debts', title: '追读债务', columns: ['id', 'debt_type', 'current_amount', 'interest_rate', 'due_chapter', 'status'], domain: 'network' },
@@ -135,7 +135,10 @@ function DashboardPage({ data }) {
     // Strand 历史统计
     const history = strand.history || []
     const strandCounts = { quest: 0, fire: 0, constellation: 0 }
-    history.forEach(h => { if (strandCounts[h.strand] !== undefined) strandCounts[h.strand]++ })
+    history.forEach(h => {
+        const key = h?.dominant || h?.strand
+        if (strandCounts[key] !== undefined) strandCounts[key]++
+    })
     const total = history.length || 1
 
     return (
@@ -165,8 +168,10 @@ function DashboardPage({ data }) {
                     <span className="stat-label">主角状态</span>
                     <span className="stat-value plain">{protagonist.name || '未设定'}</span>
                     <span className="stat-sub">
-                        {protagonist.power?.realm || '未知境界'}
-                        {protagonist.location?.current ? ` · ${protagonist.location.current}` : ''}
+                        {protagonist.power?.realm || protagonist.realm || '未知境界'}
+                        {(protagonist.location?.current || protagonist.location)
+                            ? ` · ${protagonist.location?.current || protagonist.location}`
+                            : ''}
                     </span>
                 </div>
 
@@ -364,11 +369,21 @@ function GraphPage() {
             rels.forEach(r => { relatedIds.add(r.from_entity); relatedIds.add(r.to_entity) })
             const entityMap = {}
             ents.forEach(e => { entityMap[e.id] = e })
+            const tierWeights = {
+                '核心': 8,
+                '重要': 5,
+                '次要': 3,
+                '支线': 3,
+                '装饰': 2,
+                'S': 8,
+                'A': 5,
+                'B': 3,
+            }
 
             const nodes = [...relatedIds].map(id => ({
                 id,
                 name: entityMap[id]?.canonical_name || id,
-                val: (entityMap[id]?.tier === 'S' ? 8 : entityMap[id]?.tier === 'A' ? 5 : 2),
+                val: tierWeights[entityMap[id]?.tier] || 2,
                 color: typeColors[entityMap[id]?.type] || '#5c6078'
             }))
             const links = rels.map(r => ({
@@ -454,14 +469,14 @@ function ChaptersPage() {
 // 页面 5：文档浏览
 // ====================================================================
 
-function FilesPage() {
+function FilesPage({ refreshKey }) {
     const [tree, setTree] = useState({})
     const [selectedPath, setSelectedPath] = useState(null)
     const [content, setContent] = useState('')
 
     useEffect(() => {
         fetchJSON('/api/files/tree').then(setTree).catch(() => { })
-    }, [])
+    }, [refreshKey])
 
     useEffect(() => {
         if (selectedPath) {
@@ -469,7 +484,7 @@ function FilesPage() {
                 .then(d => setContent(d.content))
                 .catch(() => setContent('[读取失败]'))
         }
-    }, [selectedPath])
+    }, [selectedPath, refreshKey])
 
     useEffect(() => {
         if (selectedPath) return

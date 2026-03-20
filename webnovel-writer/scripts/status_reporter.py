@@ -157,7 +157,8 @@ class StatusReporter:
             print(f"❌ 状态文件不存在: {self.state_file}")
             return False
 
-        with open(self.state_file, 'r', encoding='utf-8') as f:
+        # 兼容 UTF-8 BOM（utf-8-sig 可同时读取普通 UTF-8）
+        with open(self.state_file, 'r', encoding='utf-8-sig') as f:
             self.state = json.load(f)
 
         if isinstance(self.state, dict):

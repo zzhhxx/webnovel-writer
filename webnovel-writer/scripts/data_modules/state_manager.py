@@ -92,6 +92,7 @@ class StateManager:
 
     # v5.0 引入的实体类型
     ENTITY_TYPES = ["角色", "地点", "物品", "势力", "招式"]
+    SQLITE_RETRY_KEY = "_sqlite_sync_pending"
 
     def __init__(self, config=None, enable_sqlite_sync: bool = True):
         """
@@ -229,7 +230,10 @@ class StateManager:
                 self._pending_progress_words_delta != 0,
             ]
         )
-        if not has_pending:
+        has_retry_queue = isinstance(self._state.get(self.SQLITE_RETRY_KEY), list) and bool(
+            self._state.get(self.SQLITE_RETRY_KEY)
+        )
+        if not has_pending and not has_retry_queue:
             return
 
         self.config.ensure_dirs()
@@ -239,6 +243,18 @@ class StateManager:
             with lock:
                 disk_state = read_json_safe(self.config.state_file, default={})
                 disk_state = self._ensure_state_schema(disk_state)
+                retry_entries = disk_state.get(self.SQLITE_RETRY_KEY, [])
+                if isinstance(retry_entries, list):
+                    for item in retry_entries:
+                        if not isinstance(item, dict):
+                            continue
+                        retry_payload = item.get("pending")
+                        if not isinstance(retry_payload, dict):
+                            continue
+                        snapshot = self._deserialize_sqlite_pending_snapshot(retry_payload)
+                        self._merge_sqlite_pending_snapshot(snapshot)
+                # 本次写盘先移除旧重试队列；若仍失败会写入新的合并队列
+                disk_state.pop(self.SQLITE_RETRY_KEY, None)
 
                 # progress（合并为 max(chapter) + words_delta 累加）
                 if self._pending_progress_chapter is not None or self._pending_progress_words_delta != 0:
@@ -364,6 +380,14 @@ class StateManager:
                     self._clear_pending_sqlite_data()
                 else:
                     self._restore_sqlite_pending(sqlite_pending_snapshot)
+                    self._persist_sqlite_retry_queue(
+                        disk_state,
+                        sqlite_pending_snapshot,
+                        "SQLite sync failed in save_state",
+                    )
+                    raise RuntimeError(
+                        "SQLite 同步失败：本次待写数据已持久化到 _sqlite_sync_pending，请重试同一命令。"
+                    )
 
         except filelock.Timeout:
             raise RuntimeError("无法获取 state.json 文件锁，请稍后重试")
@@ -554,7 +578,7 @@ class StateManager:
             return True
 
         except Exception as e:
-            # SQLite 同步失败时记录警告（不中断主流程）
+            # SQLite 同步失败时记录警告，由 save_state 统一决定回滚与抛错
             logger.warning("SQLite sync failed: %s", e)
             return False
 
@@ -581,6 +605,168 @@ class StateManager:
             "relationships_new": [],
             "chapter": None,
         })
+
+    def _serialize_sqlite_pending_snapshot(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """将 pending 快照转为可写入 state.json 的结构。"""
+        serialized_patches: List[Dict[str, Any]] = []
+        for (entity_type, entity_id), patch in snapshot.get("entity_patches", {}).items():
+            if not isinstance(patch, _EntityPatch):
+                continue
+            serialized_patches.append(
+                {
+                    "entity_type": entity_type,
+                    "entity_id": entity_id,
+                    "replace": bool(patch.replace),
+                    "base_entity": deepcopy(patch.base_entity),
+                    "top_updates": deepcopy(patch.top_updates),
+                    "current_updates": deepcopy(patch.current_updates),
+                    "appearance_chapter": patch.appearance_chapter,
+                }
+            )
+
+        return {
+            "entity_patches": serialized_patches,
+            "alias_entries": deepcopy(snapshot.get("alias_entries", {})),
+            "state_changes": deepcopy(snapshot.get("state_changes", [])),
+            "structured_relationships": deepcopy(snapshot.get("structured_relationships", [])),
+            "sqlite_data": deepcopy(
+                snapshot.get(
+                    "sqlite_data",
+                    {
+                        "entities_appeared": [],
+                        "entities_new": [],
+                        "state_changes": [],
+                        "relationships_new": [],
+                        "chapter": None,
+                    },
+                )
+            ),
+        }
+
+    def _deserialize_sqlite_pending_snapshot(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """将 state.json 中的重试结构恢复为内存 pending 快照。"""
+        entity_patches: Dict[tuple[str, str], _EntityPatch] = {}
+        for item in payload.get("entity_patches", []) or []:
+            if not isinstance(item, dict):
+                continue
+            entity_type = str(item.get("entity_type", "") or "").strip()
+            entity_id = str(item.get("entity_id", "") or "").strip()
+            if not entity_type or not entity_id:
+                continue
+            entity_patches[(entity_type, entity_id)] = _EntityPatch(
+                entity_type=entity_type,
+                entity_id=entity_id,
+                replace=bool(item.get("replace", False)),
+                base_entity=deepcopy(item.get("base_entity")),
+                top_updates=deepcopy(item.get("top_updates", {})) if isinstance(item.get("top_updates"), dict) else {},
+                current_updates=deepcopy(item.get("current_updates", {}))
+                if isinstance(item.get("current_updates"), dict)
+                else {},
+                appearance_chapter=item.get("appearance_chapter"),
+            )
+
+        alias_entries = payload.get("alias_entries", {})
+        if not isinstance(alias_entries, dict):
+            alias_entries = {}
+
+        state_changes = payload.get("state_changes", [])
+        if not isinstance(state_changes, list):
+            state_changes = []
+
+        structured_relationships = payload.get("structured_relationships", [])
+        if not isinstance(structured_relationships, list):
+            structured_relationships = []
+
+        sqlite_data = payload.get("sqlite_data", {})
+        if not isinstance(sqlite_data, dict):
+            sqlite_data = {}
+
+        return {
+            "entity_patches": entity_patches,
+            "alias_entries": deepcopy(alias_entries),
+            "state_changes": deepcopy(state_changes),
+            "structured_relationships": deepcopy(structured_relationships),
+            "sqlite_data": {
+                "entities_appeared": list(sqlite_data.get("entities_appeared", []) or []),
+                "entities_new": list(sqlite_data.get("entities_new", []) or []),
+                "state_changes": list(sqlite_data.get("state_changes", []) or []),
+                "relationships_new": list(sqlite_data.get("relationships_new", []) or []),
+                "chapter": sqlite_data.get("chapter"),
+            },
+        }
+
+    def _merge_sqlite_pending_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """将重试快照合并到当前 pending。"""
+        for key, patch in snapshot.get("entity_patches", {}).items():
+            if not isinstance(key, tuple) or len(key) != 2 or not isinstance(patch, _EntityPatch):
+                continue
+            existing = self._pending_entity_patches.get(key)
+            if existing is None:
+                self._pending_entity_patches[key] = deepcopy(patch)
+                continue
+            existing.replace = existing.replace or patch.replace
+            if existing.base_entity is None and patch.base_entity is not None:
+                existing.base_entity = deepcopy(patch.base_entity)
+            existing.top_updates.update(patch.top_updates or {})
+            existing.current_updates.update(patch.current_updates or {})
+            if patch.appearance_chapter is not None:
+                if existing.appearance_chapter is None:
+                    existing.appearance_chapter = patch.appearance_chapter
+                else:
+                    existing.appearance_chapter = max(existing.appearance_chapter, patch.appearance_chapter)
+
+        for alias, entries in (snapshot.get("alias_entries", {}) or {}).items():
+            if not isinstance(entries, list):
+                continue
+            existing = self._pending_alias_entries.setdefault(alias, [])
+            seen = {(str(e.get("type", "")), str(e.get("id", ""))) for e in existing if isinstance(e, dict)}
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                key = (str(entry.get("type", "")), str(entry.get("id", "")))
+                if key in seen:
+                    continue
+                existing.append(deepcopy(entry))
+                seen.add(key)
+
+        self._pending_state_changes.extend(deepcopy(snapshot.get("state_changes", []) or []))
+        self._pending_structured_relationships.extend(
+            deepcopy(snapshot.get("structured_relationships", []) or [])
+        )
+
+        sqlite_data = snapshot.get("sqlite_data", {}) or {}
+        for field in ("entities_appeared", "entities_new", "state_changes", "relationships_new"):
+            self._pending_sqlite_data[field].extend(deepcopy(sqlite_data.get(field, []) or []))
+        incoming_chapter = sqlite_data.get("chapter")
+        if incoming_chapter is not None:
+            current_chapter = self._pending_sqlite_data.get("chapter")
+            if current_chapter is None:
+                self._pending_sqlite_data["chapter"] = incoming_chapter
+            else:
+                try:
+                    self._pending_sqlite_data["chapter"] = max(int(current_chapter), int(incoming_chapter))
+                except (TypeError, ValueError):
+                    self._pending_sqlite_data["chapter"] = incoming_chapter
+
+    def _persist_sqlite_retry_queue(
+        self,
+        disk_state: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        error_message: str,
+    ) -> None:
+        """将 SQLite 待同步数据持久化到 state.json，避免进程退出后丢失。"""
+        queue = disk_state.get(self.SQLITE_RETRY_KEY, [])
+        if not isinstance(queue, list):
+            queue = []
+        queue.append(
+            {
+                "created_at": datetime.now().isoformat(),
+                "error": str(error_message),
+                "pending": self._serialize_sqlite_pending_snapshot(snapshot),
+            }
+        )
+        disk_state[self.SQLITE_RETRY_KEY] = queue[-20:]
+        atomic_write_json(self.config.state_file, disk_state, use_lock=False, backup=True)
 
     def _clear_pending_sqlite_data(self):
         """清空待同步的 SQLite 数据"""
@@ -1338,7 +1524,16 @@ def main():
             return
 
         warnings = manager.process_chapter_result(args.chapter, validated.model_dump(by_alias=True))
-        manager.save_state()
+        try:
+            manager.save_state()
+        except RuntimeError as exc:
+            emit_error(
+                "SQLITE_SYNC_FAILED",
+                f"章节处理已中止: {exc}",
+                suggestion="请重试同一条 process-chapter 命令，系统会尝试回放 _sqlite_sync_pending 队列。",
+                chapter=args.chapter,
+            )
+            return
         emit_success({"chapter": args.chapter, "warnings": warnings}, message="chapter_processed", chapter=args.chapter)
 
     else:

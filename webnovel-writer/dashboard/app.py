@@ -38,6 +38,17 @@ def _webnovel_dir() -> Path:
     return _get_project_root() / ".webnovel"
 
 
+def _iter_browse_roots(root: Path) -> list[tuple[str, Path]]:
+    """返回文件浏览允许的根目录列表（名称, 路径）。"""
+    return [
+        ("正文", root / "正文"),
+        ("大纲", root / "大纲"),
+        ("设定集", root / "设定集"),
+        ("审查报告", root / "审查报告"),
+        (".webnovel/reports", root / ".webnovel" / "reports"),
+    ]
+
+
 # ---------------------------------------------------------------------------
 # 应用工厂
 # ---------------------------------------------------------------------------
@@ -51,8 +62,13 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
     @asynccontextmanager
     async def _lifespan(_: FastAPI):
         webnovel = _webnovel_dir()
+        extra_watch_dirs = [_get_project_root() / "审查报告"]
         if webnovel.is_dir():
-            _watcher.start(webnovel, asyncio.get_running_loop())
+            _watcher.start(
+                webnovel,
+                asyncio.get_running_loop(),
+                extra_watch_dirs=extra_watch_dirs,
+            )
         try:
             yield
         finally:
@@ -77,7 +93,7 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
         state_path = _webnovel_dir() / "state.json"
         if not state_path.is_file():
             raise HTTPException(404, "state.json 不存在")
-        return json.loads(state_path.read_text(encoding="utf-8"))
+        return json.loads(state_path.read_text(encoding="utf-8-sig"))
 
     # ===========================================================
     # API：实体数据库（index.db 只读查询）
@@ -341,11 +357,10 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
 
     @app.get("/api/files/tree")
     def file_tree():
-        """列出 正文/、大纲/、设定集/ 三个目录的树结构。"""
+        """列出可浏览目录的树结构。"""
         root = _get_project_root()
         result = {}
-        for folder_name in ("正文", "大纲", "设定集"):
-            folder = root / folder_name
+        for folder_name, folder in _iter_browse_roots(root):
             if not folder.is_dir():
                 result[folder_name] = []
                 continue
@@ -354,23 +369,19 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
 
     @app.get("/api/files/read")
     def file_read(path: str):
-        """只读读取一个文件内容（限 正文/大纲/设定集 目录）。"""
+        """只读读取一个文件内容（限允许目录）。"""
         root = _get_project_root()
         resolved = safe_resolve(root, path)
 
-        # 二次限制：只允许三大目录
-        allowed_parents = [root / n for n in ("正文", "大纲", "设定集")]
+        # 二次限制：只允许白名单目录
+        allowed_parents = [folder for _, folder in _iter_browse_roots(root)]
         if not any(_is_child(resolved, p) for p in allowed_parents):
-            raise HTTPException(403, "仅允许读取 正文/大纲/设定集 目录下的文件")
+            raise HTTPException(403, "仅允许读取白名单目录下的文件")
 
         if not resolved.is_file():
             raise HTTPException(404, "文件不存在")
 
-        # 文本文件直接读；其他情况返回占位信息
-        try:
-            content = resolved.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            content = "[二进制文件，无法预览]"
+        content = _read_text_with_fallback(resolved)
 
         return {"path": path, "content": content}
 
@@ -442,3 +453,18 @@ def _is_child(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _read_text_with_fallback(path: Path) -> str:
+    """以多编码回退读取文本，避免编码不一致导致误判不可预览。"""
+    data = path.read_bytes()
+    if b"\x00" in data:
+        return "[二进制文件，无法预览]"
+
+    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk", "big5"):
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+
+    return data.decode("utf-8", errors="replace")

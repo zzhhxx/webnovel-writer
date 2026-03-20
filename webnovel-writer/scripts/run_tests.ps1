@@ -14,23 +14,70 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
 
 Set-Location $ProjectRoot
 
+$pythonExe = ""
+if (-not (Test-Path $pythonExe)) {
+    $pythonExe = "python"
+}
+
+$scriptRootCandidates = @(
+    (Join-Path $ProjectRoot "webnovel-writer\\scripts"),
+    (Join-Path $ProjectRoot "scripts"),
+    (Join-Path $ProjectRoot ".claude\\scripts")
+)
+$scriptRoot = $null
+foreach ($candidate in $scriptRootCandidates) {
+    if (Test-Path $candidate) {
+        $scriptRoot = $candidate
+        break
+    }
+}
+if (-not $scriptRoot) {
+    throw "Script root not found. Tried: webnovel-writer/scripts, scripts, .claude/scripts."
+}
+
+$testsRoot = Join-Path $scriptRoot "data_modules\\tests"
+if (-not (Test-Path $testsRoot)) {
+    throw "Tests root not found: $testsRoot"
+}
+
 $tmpRoot = Join-Path $ProjectRoot ".tmp\\pytest"
 New-Item -ItemType Directory -Path $tmpRoot -Force | Out-Null
 
+$origTMP = $env:TMP
+$origTEMP = $env:TEMP
 $env:TMP = $tmpRoot
 $env:TEMP = $tmpRoot
-$env:PYTHONPATH = ".claude/scripts"
+$env:PYTHONPATH = $scriptRoot
 
-# 避免 Windows 下 basetemp 目录因权限/残留锁导致 rm_rf 失败（会让所有用例在 setup 阶段直接报错）。
+# Unique basetemp to avoid stale lock/permission conflicts on Windows.
 $runId = Get-Date -Format "yyyyMMdd_HHmmssfff"
 $baseTemp = Join-Path $tmpRoot ("run-" + $Mode + "-" + $runId)
+$useIsolatedTemp = $true
+
+$ignoreArgs = @()
+$knownBadDirs = @(
+    "localtmp",
+    "permtemp",
+    "runtime_pytest",
+    "tmphkqtr09m",
+    "tmpx",
+    ".pytest_tmp2"
+)
+foreach ($dirName in $knownBadDirs) {
+    $badDir = Join-Path $testsRoot $dirName
+    if (Test-Path $badDir -ErrorAction SilentlyContinue) {
+        $ignoreArgs += @("--ignore", $badDir)
+    }
+}
 
 Write-Host "ProjectRoot: $ProjectRoot"
 Write-Host "TMP/TEMP: $tmpRoot"
 Write-Host "Mode: $Mode"
+Write-Host "Python: $pythonExe"
+Write-Host "ScriptRoot: $scriptRoot"
+Write-Host "TestsRoot: $testsRoot"
 
-# 预检：某些 Windows Python 发行版（尤其 WindowsApps shim）在 tempfile.mkdtemp 时会创建“不可访问目录”，
-# 会导致 pytest 在创建/清理临时目录阶段直接 WinError 5。
+# Precheck temp dir permissions. Some Python builds create inaccessible temp dirs.
 @'
 import tempfile
 from pathlib import Path
@@ -38,32 +85,59 @@ import sys
 
 try:
     d = Path(tempfile.mkdtemp(prefix="webnovel_writer_pytest_"))
-    # 既要能列目录，也要能写文件；否则 pytest 必挂。
     list(d.iterdir())
     (d / "probe.txt").write_text("ok", encoding="utf-8")
 except Exception as exc:
     print(f"PYTEST_TMPDIR_PRECHECK_FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
     raise
-'@ | python - 2>$null
-if ($LASTEXITCODE -ne 0) {
+'@ | Set-Variable -Name precheckScript
+$oldEAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+$precheckOutput = $precheckScript | & $pythonExe - 2>&1
+$precheckExitCode = $LASTEXITCODE
+$ErrorActionPreference = $oldEAP
+
+if ($precheckExitCode -ne 0) {
     Write-Host ""
-    Write-Host "❌ Python 临时目录预检失败（常见原因：WindowsApps 的 python.exe shim / 权限异常）"
-    Write-Host "建议：改用标准 Python（python.org 安装版）或用 uv/uvx 提供的 Python 运行测试。"
-    exit 1
+    Write-Host "Warning: temp dir precheck failed."
+    if ($precheckOutput) {
+        $precheckOutput | ForEach-Object { Write-Host $_ }
+    }
+    Write-Host "Fallback: use system temp dir and do not force --basetemp."
+    $useIsolatedTemp = $false
+    if ($null -ne $origTMP -and "$origTMP" -ne "") {
+        $env:TMP = $origTMP
+    } else {
+        Remove-Item Env:TMP -ErrorAction SilentlyContinue
+    }
+    if ($null -ne $origTEMP -and "$origTEMP" -ne "") {
+        $env:TEMP = $origTEMP
+    } else {
+        Remove-Item Env:TEMP -ErrorAction SilentlyContinue
+    }
 }
 
 if ($Mode -eq "smoke") {
-    python -m pytest -q `
-        .claude/scripts/data_modules/tests/test_extract_chapter_context.py `
-        .claude/scripts/data_modules/tests/test_rag_adapter.py `
-        --basetemp $baseTemp `
-        --no-cov `
-        -p no:cacheprovider
+    $smokeTests = @(
+        (Join-Path $testsRoot "test_extract_chapter_context.py"),
+        (Join-Path $testsRoot "test_rag_adapter.py")
+    )
+    foreach ($t in $smokeTests) {
+        if (-not (Test-Path $t)) {
+            throw "Smoke test file not found: $t"
+        }
+    }
+    $smokeArgs = @("-m", "pytest", "-q") + $smokeTests + @("--no-cov", "-p", "no:cacheprovider") + $ignoreArgs
+    if ($useIsolatedTemp) {
+        $smokeArgs += @("--basetemp", $baseTemp)
+    }
+    & $pythonExe @smokeArgs
     exit $LASTEXITCODE
 }
 
-python -m pytest -q `
-    .claude/scripts/data_modules/tests `
-    --basetemp $baseTemp `
-    -p no:cacheprovider
+$fullArgs = @("-m", "pytest", "-q", $testsRoot, "--no-cov", "-p", "no:cacheprovider") + $ignoreArgs
+if ($useIsolatedTemp) {
+    $fullArgs += @("--basetemp", $baseTemp)
+}
+& $pythonExe @fullArgs
 exit $LASTEXITCODE

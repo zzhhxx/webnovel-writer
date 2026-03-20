@@ -37,6 +37,7 @@ import os
 import sys
 import argparse
 from datetime import datetime
+from copy import deepcopy
 from pathlib import Path
 
 from runtime_compat import enable_windows_utf8_stdio
@@ -105,7 +106,8 @@ class ArchiveManager:
             print(f"❌ state.json 不存在: {self.state_file}")
             sys.exit(1)
 
-        with open(self.state_file, 'r', encoding='utf-8') as f:
+        # 兼容 UTF-8 BOM 文件，避免 JSONDecodeError
+        with open(self.state_file, 'r', encoding='utf-8-sig') as f:
             return json.load(f)
 
     def save_state(self, state):
@@ -119,13 +121,13 @@ class ArchiveManager:
         if not archive_file.exists():
             return []
 
-        with open(archive_file, 'r', encoding='utf-8') as f:
+        # 兼容 UTF-8 BOM 文件，避免 JSONDecodeError
+        with open(archive_file, 'r', encoding='utf-8-sig') as f:
             return json.load(f)
 
     def save_archive(self, archive_file, data):
-        """保存归档文件"""
-        with open(archive_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        """保存归档文件（原子化写入 + 文件锁）"""
+        atomic_write_json(archive_file, data, use_lock=True, backup=True)
 
     def check_trigger_conditions(self, state):
         """检查是否需要触发归档"""
@@ -159,6 +161,8 @@ class ArchiveManager:
             # 只归档次要角色（tier="装饰" 或 tier="支线"）
             tier = str(char.get("tier", "")).strip()
             if tier == "核心":
+                continue
+            if bool(char.get("is_protagonist")):
                 continue
 
             # 检查最后出场章节
@@ -244,6 +248,8 @@ class ArchiveManager:
         threshold = self.config["review_old_threshold"]
 
         def _parse_end_chapter(review: dict) -> int:
+            if not isinstance(review, dict):
+                return 0
             # 新格式：{"chapters":"5-6","report":"...","reviewed_at":"..."}
             chapters = review.get("chapters")
             if isinstance(chapters, str):
@@ -283,6 +289,8 @@ class ArchiveManager:
 
         old_reviews = []
         for review in reviews:
+            if not isinstance(review, dict):
+                continue
             review_chapter = _parse_end_chapter(review)
             chapters_since_review = current_chapter - review_chapter
 
@@ -302,27 +310,58 @@ class ArchiveManager:
 
         # 加载现有归档
         archived = self.load_archive(self.characters_archive)
+        original_archived = deepcopy(archived)
 
         # 添加时间戳
         timestamp = datetime.now().isoformat()
+        rollback_status: dict[str, str] = {}
         for item in inactive_list:
             item["character"]["archived_at"] = timestamp
             archived.append(item["character"])
-
-            # v5.1 引入: 通过 IndexManager 更新实体状态
-            if not dry_run:
+            entity_id = item["character"].get("id")
+            if entity_id:
                 try:
-                    entity_id = item["character"].get("id")
-                    if entity_id:
-                        # 更新实体的 current_json 添加 archived 标记
-                        self._index_manager.update_entity_field(
-                            entity_id, "status", "archived"
-                        )
-                except Exception as e:
-                    print(f"⚠️ 实体状态更新失败（不影响归档）: {e}")
+                    existing = self._index_manager.get_entity(entity_id) or {}
+                    current_json = existing.get("current_json", {})
+                    if isinstance(current_json, dict):
+                        prev_status = str(current_json.get("status", "") or "")
+                    else:
+                        prev_status = ""
+                except Exception:
+                    prev_status = ""
+                rollback_status[str(entity_id)] = prev_status
 
-        if not dry_run:
-            self.save_archive(self.characters_archive, archived)
+        if dry_run:
+            return len(inactive_list)
+
+        # 先落归档文件，避免“已改 SQLite 但归档文件未写成”的跨存储不一致
+        self.save_archive(self.characters_archive, archived)
+
+        updated_ids: list[str] = []
+        try:
+            for item in inactive_list:
+                entity_id = str(item["character"].get("id", "") or "").strip()
+                if not entity_id:
+                    continue
+                ok = self._index_manager.update_entity_field(entity_id, "status", "archived")
+                if not ok:
+                    raise RuntimeError(f"实体不存在或状态更新失败: {entity_id}")
+                updated_ids.append(entity_id)
+        except Exception as exc:
+            # 回滚 SQLite 状态
+            for entity_id in updated_ids:
+                try:
+                    prev = rollback_status.get(entity_id, "")
+                    restore_value = prev if prev else "active"
+                    self._index_manager.update_entity_field(entity_id, "status", restore_value)
+                except Exception:
+                    pass
+            # 回滚归档文件
+            try:
+                self.save_archive(self.characters_archive, original_archived)
+            except Exception:
+                pass
+            raise RuntimeError(f"角色归档失败，已执行回滚: {exc}") from exc
 
         return len(inactive_list)
 
@@ -371,22 +410,30 @@ class ArchiveManager:
 
         # 移除已归档的伏笔
         if resolved_threads:
-            thread_ids = {
-                (item.get("thread", {}) or {}).get("content") or (item.get("thread", {}) or {}).get("description")
+            def _thread_fingerprint(thread: dict) -> str:
+                if not isinstance(thread, dict):
+                    return ""
+                cloned = dict(thread)
+                cloned.pop("archived_at", None)
+                return json.dumps(cloned, ensure_ascii=False, sort_keys=True)
+
+            thread_keys = {
+                _thread_fingerprint(item.get("thread", {}) or {})
                 for item in resolved_threads
+                if isinstance(item, dict)
             }
-            thread_ids = {t for t in thread_ids if isinstance(t, str) and t.strip()}
+            thread_keys = {k for k in thread_keys if k}
 
             plot_threads = state.get("plot_threads", {}) or {}
             if isinstance(plot_threads.get("foreshadowing"), list):
                 plot_threads["foreshadowing"] = [
                     t for t in plot_threads["foreshadowing"]
-                    if not isinstance(t, dict) or (t.get("content") or t.get("description")) not in thread_ids
+                    if not isinstance(t, dict) or _thread_fingerprint(t) not in thread_keys
                 ]
             if isinstance(plot_threads.get("resolved"), list):
                 plot_threads["resolved"] = [
                     t for t in plot_threads["resolved"]
-                    if not isinstance(t, dict) or (t.get("content") or t.get("description")) not in thread_ids
+                    if not isinstance(t, dict) or _thread_fingerprint(t) not in thread_keys
                 ]
             state["plot_threads"] = plot_threads
 
@@ -394,15 +441,26 @@ class ArchiveManager:
         if old_reviews:
             review_keys = set()
             for item in old_reviews:
+                if not isinstance(item, dict):
+                    continue
                 review = item.get("review", {}) or {}
+                if not isinstance(review, dict):
+                    continue
                 key = review.get("report") or review.get("reviewed_at") or review.get("date")
                 if isinstance(key, str) and key.strip():
                     review_keys.add(key)
 
-            state["review_checkpoints"] = [
-                review for review in state.get("review_checkpoints", [])
-                if (review.get("report") or review.get("reviewed_at") or review.get("date")) not in review_keys
-            ]
+            checkpoints = state.get("review_checkpoints", [])
+            if isinstance(checkpoints, list):
+                filtered = []
+                for review in checkpoints:
+                    if not isinstance(review, dict):
+                        filtered.append(review)
+                        continue
+                    key = review.get("report") or review.get("reviewed_at") or review.get("date")
+                    if key not in review_keys:
+                        filtered.append(review)
+                state["review_checkpoints"] = filtered
 
         return state
 
@@ -483,7 +541,7 @@ class ArchiveManager:
         # 查找角色
         char_to_restore = None
         for char in archived:
-            if char["name"] == name:
+            if isinstance(char, dict) and char.get("name") == name:
                 char_to_restore = char
                 break
 
@@ -494,18 +552,41 @@ class ArchiveManager:
         # 移除 archived_at 字段
         char_to_restore.pop("archived_at", None)
 
-        # 原子性修复：先从归档中移除
-        archived = [char for char in archived if char["name"] != name]
-        self.save_archive(self.characters_archive, archived)
-
-        # v5.1 引入: 恢复到 SQLite (通过 IndexManager)
         char_id = char_to_restore.get("id", char_to_restore.get("name", "unknown"))
         try:
-            # 更新实体状态为 active
-            self._index_manager.update_entity_field(char_id, "status", "active")
-            print(f"✅ 角色已恢复: {name}")
-        except Exception as e:
-            print(f"⚠️ 实体状态恢复失败: {e}")
+            current = self._index_manager.get_entity(char_id) or {}
+            current_json = current.get("current_json", {})
+            if isinstance(current_json, dict):
+                prev_status = str(current_json.get("status", "") or "")
+            else:
+                prev_status = ""
+        except Exception:
+            prev_status = ""
+
+        # 先恢复 SQLite，成功后再改归档文件，避免“归档已删但实体未恢复”丢数据
+        try:
+            ok = self._index_manager.update_entity_field(char_id, "status", "active")
+            if not ok:
+                raise RuntimeError(f"实体不存在或状态更新失败: {char_id}")
+        except Exception as exc:
+            raise RuntimeError(f"角色状态恢复失败（归档未变更）: {exc}") from exc
+
+        updated_archive = [
+            char for char in archived
+            if not (isinstance(char, dict) and char.get("name") == name)
+        ]
+        try:
+            self.save_archive(self.characters_archive, updated_archive)
+        except Exception as exc:
+            # 回滚 SQLite 状态，尽量维持一致性
+            try:
+                rollback_value = prev_status if prev_status else "archived"
+                self._index_manager.update_entity_field(char_id, "status", rollback_value)
+            except Exception:
+                pass
+            raise RuntimeError(f"归档文件更新失败，已回滚实体状态: {exc}") from exc
+
+        print(f"✅ 角色已恢复: {name}")
 
     def show_stats(self):
         """显示归档统计"""
@@ -553,14 +634,18 @@ def main():
     manager = ArchiveManager(project_root=project_root)
 
     # 执行操作
-    if args.auto_check or args.force:
-        manager.run_auto_check(force=args.force, dry_run=args.dry_run)
-    elif args.restore_character:
-        manager.restore_character(args.restore_character)
-    elif args.stats:
-        manager.show_stats()
-    else:
-        parser.print_help()
+    try:
+        if args.auto_check or args.force:
+            manager.run_auto_check(force=args.force, dry_run=args.dry_run)
+        elif args.restore_character:
+            manager.restore_character(args.restore_character)
+        elif args.stats:
+            manager.show_stats()
+        else:
+            parser.print_help()
+    except Exception as exc:
+        print(f"❌ 操作失败: {exc}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -344,14 +344,40 @@ def test_save_state_preserves_sqlite_pending_on_sync_failure(temp_project):
     manager._sql_state_manager = _BrokenSQLManager()
     manager._pending_sqlite_data["chapter"] = 1
 
-    manager.save_state()
+    with pytest.raises(RuntimeError):
+        manager.save_state()
 
     state = json.loads(temp_project.state_file.read_text(encoding="utf-8"))
     assert state.get("_migrated_to_sqlite") is True
+    retry_queue = state.get("_sqlite_sync_pending")
+    assert isinstance(retry_queue, list)
+    assert retry_queue
 
     # SQLite 同步失败后，SQLite 相关 pending 不应被清空，便于后续重试
     assert manager._pending_entity_patches
     assert manager._pending_sqlite_data.get("chapter") == 1
+
+
+def test_save_state_preserves_existing_data_from_bom_file(temp_project):
+    raw_state = {
+        "progress": {"current_chapter": 1, "total_words": 100},
+        "review_checkpoints": [{"chapters": "1-1", "report": "审查报告/r1.md"}],
+        "custom_block": {"keep": True},
+    }
+    temp_project.state_file.write_text(
+        json.dumps(raw_state, ensure_ascii=False),
+        encoding="utf-8-sig",
+    )
+
+    manager = StateManager(temp_project, enable_sqlite_sync=False)
+    manager.update_progress(2, 10)
+    manager.save_state()
+
+    updated = json.loads(temp_project.state_file.read_text(encoding="utf-8"))
+    assert updated["custom_block"]["keep"] is True
+    assert updated["review_checkpoints"][0]["report"] == "审查报告/r1.md"
+    assert updated["progress"]["current_chapter"] == 2
+    assert updated["progress"]["total_words"] == 110
 
 
 def test_save_state_progress_and_disambiguation_merge(temp_project):
@@ -398,7 +424,12 @@ def test_sync_to_sqlite_exceptions_and_no_sql_manager(temp_project, monkeypatch)
     monkeypatch.setattr(manager._sql_state_manager, "process_chapter_entities", boom)
     monkeypatch.setattr(manager._sql_state_manager, "register_alias", boom)
 
-    manager.save_state()
+    with pytest.raises(RuntimeError):
+        manager.save_state()
+    saved = json.loads(temp_project.state_file.read_text(encoding="utf-8"))
+    retry_queue = saved.get("_sqlite_sync_pending")
+    assert isinstance(retry_queue, list)
+    assert retry_queue
 
     manager_no_sql = StateManager(temp_project, enable_sqlite_sync=False)
     manager_no_sql._sync_pending_patches_to_sqlite()
@@ -491,6 +522,9 @@ def test_sync_protagonist_from_string_and_empty_updates(temp_project):
 
 
 def test_state_manager_cli_commands(temp_project, monkeypatch, capsys):
+    temp_project.state_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_project.state_file.write_text("{}", encoding="utf-8")
+
     idx = IndexManager(temp_project)
     idx.upsert_entity(
         EntityMeta(
