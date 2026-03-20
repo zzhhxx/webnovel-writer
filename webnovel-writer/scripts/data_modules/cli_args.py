@@ -23,6 +23,11 @@ from pathlib import Path
 from typing import Any
 from typing import List, Optional, Tuple
 
+try:
+    from security_utils import read_text_safe
+except ImportError:  # pragma: no cover
+    from scripts.security_utils import read_text_safe
+
 
 def _extract_flag_value(argv: List[str], flag: str) -> Tuple[Optional[str], List[str]]:
     """
@@ -91,6 +96,9 @@ def load_json_arg(raw: str) -> Any:
         if target == "-":
             content = sys.stdin.read()
         else:
-            content = Path(target).read_text(encoding="utf-8")
+            path = Path(target)
+            if not path.exists():
+                raise FileNotFoundError(f"json file not found: {path}")
+            content = read_text_safe(path, default="", auto_repair=True, backup_on_repair=False)
         return json.loads(content)
     return json.loads(text)

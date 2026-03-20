@@ -21,6 +21,10 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from chapter_outline_loader import load_chapter_outline
+try:
+    from security_utils import read_json_safe, read_text_safe
+except ImportError:  # pragma: no cover
+    from scripts.security_utils import read_json_safe, read_text_safe
 
 from runtime_compat import enable_windows_utf8_stdio
 
@@ -74,7 +78,10 @@ def _load_summary_file(project_root: Path, chapter_num: int) -> str:
     if not summary_path.exists():
         return ""
 
-    text = summary_path.read_text(encoding="utf-8")
+    text = read_text_safe(summary_path, default="", auto_repair=True, backup_on_repair=False)
+    if not text:
+        return ""
+
     summary_match = re.search(r"##\s*剧情摘要\s*\r?\n(.+?)(?=\r?\n##|$)", text, re.DOTALL)
     if summary_match:
         return summary_match.group(1).strip()
@@ -91,7 +98,9 @@ def extract_chapter_summary(project_root: Path, chapter_num: int) -> str:
     if not chapter_file or not chapter_file.exists():
         return f"⚠️ 第{chapter_num}章文件不存在"
 
-    content = chapter_file.read_text(encoding="utf-8")
+    content = read_text_safe(chapter_file, default="", auto_repair=True, backup_on_repair=False)
+    if not content:
+        return f"⚠️ 第{chapter_num}章文件读取失败"
 
     summary_match = re.search(r"##\s*本章摘要\s*\r?\n(.+?)(?=\r?\n##|$)", content, re.DOTALL)
     if summary_match:
@@ -113,7 +122,9 @@ def extract_state_summary(project_root: Path) -> str:
     if not state_file.exists():
         return "⚠️ state.json 不存在"
 
-    state = json.loads(state_file.read_text(encoding="utf-8"))
+    state = read_json_safe(state_file, default={}, auto_repair=True, backup_on_repair=False)
+    if not isinstance(state, dict):
+        return "⚠️ state.json 格式无效"
     summary_parts: List[str] = []
 
     if "progress" in state:

@@ -57,7 +57,7 @@ def test_index_manager_save_review_metrics_syncs_state_checkpoint(tmp_path, monk
     )
     index_manager_module.main()
 
-    updated = json.loads(cfg.state_file.read_text(encoding="utf-8-sig"))
+    updated = json.loads(cfg.state_file.read_text(encoding="utf-8"))
     checkpoints = updated.get("review_checkpoints", [])
     assert checkpoints
     assert checkpoints[-1]["chapters"] == "1-2"
@@ -108,7 +108,7 @@ def test_index_manager_save_review_metrics_rejects_missing_report_file(tmp_path,
     output = capsys.readouterr().out
     assert "INVALID_REPORT_FILE" in output
 
-    updated = json.loads(cfg.state_file.read_text(encoding="utf-8-sig"))
+    updated = json.loads(cfg.state_file.read_text(encoding="utf-8"))
     assert updated.get("review_checkpoints", []) == []
 
     with sqlite3.connect(cfg.index_db) as conn:

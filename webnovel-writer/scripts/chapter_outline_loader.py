@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
+
+try:
+    from security_utils import read_json_safe, read_text_safe
+except ImportError:  # pragma: no cover
+    from scripts.security_utils import read_json_safe, read_text_safe
 
 try:
     from chapter_paths import volume_num_for_chapter
@@ -37,11 +41,7 @@ def volume_num_for_chapter_from_state(project_root: Path, chapter_num: int) -> i
     if not state_path.exists():
         return None
 
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
-
+    state = read_json_safe(state_path, default={}, auto_repair=True, backup_on_repair=False)
     if not isinstance(state, dict):
         return None
 
@@ -114,13 +114,20 @@ def load_chapter_outline(project_root: Path, chapter_num: int, max_chars: int | 
 
     split_outline = _find_split_outline_file(outline_dir, chapter_num)
     if split_outline is not None:
-        return split_outline.read_text(encoding="utf-8")
+        content = read_text_safe(split_outline, default="", auto_repair=True, backup_on_repair=False)
+        if content:
+            return content
+        return f"⚠️ 大纲文件读取失败：{split_outline.name}"
 
     volume_outline = _find_volume_outline_file(project_root, chapter_num)
     if volume_outline is None:
         return f"⚠️ 大纲文件不存在：第 {chapter_num} 章"
 
-    outline = _extract_outline_section(volume_outline.read_text(encoding="utf-8"), chapter_num)
+    volume_content = read_text_safe(volume_outline, default="", auto_repair=True, backup_on_repair=False)
+    if not volume_content:
+        return f"⚠️ 大纲文件读取失败：{volume_outline.name}"
+
+    outline = _extract_outline_section(volume_content, chapter_num)
     if outline is None:
         return f"⚠️ 未找到第 {chapter_num} 章的大纲"
 

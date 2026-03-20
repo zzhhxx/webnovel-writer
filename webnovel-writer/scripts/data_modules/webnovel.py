@@ -242,6 +242,9 @@ def main() -> None:
     p_archive = sub.add_parser("archive", help="转发到 archive_manager.py")
     p_archive.add_argument("args", nargs=argparse.REMAINDER)
 
+    p_repair_encoding = sub.add_parser("repair-encoding", help="转发到 repair_utf8_encoding.py（编码修复）")
+    p_repair_encoding.add_argument("args", nargs=argparse.REMAINDER)
+
     p_init = sub.add_parser("init", help="转发到 init_project.py（初始化项目）")
     p_init.add_argument("args", nargs=argparse.REMAINDER)
 
@@ -300,6 +303,8 @@ def main() -> None:
         raise SystemExit(_run_script("backup_manager.py", [*forward_args, *rest]))
     if tool == "archive":
         raise SystemExit(_run_script("archive_manager.py", [*forward_args, *rest]))
+    if tool == "repair-encoding":
+        raise SystemExit(_run_script("repair_utf8_encoding.py", [*forward_args, *rest]))
     if tool == "extract-context":
         return_args = [*forward_args, "--chapter", str(args.chapter), "--format", str(args.format)]
         raise SystemExit(_run_script("extract_chapter_context.py", return_args))

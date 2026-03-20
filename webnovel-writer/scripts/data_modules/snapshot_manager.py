@@ -5,7 +5,6 @@ Context snapshot manager.
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from filelock import FileLock
@@ -16,10 +15,10 @@ from .config import get_config
 
 try:
     # 当 scripts 目录在 sys.path 中
-    from security_utils import atomic_write_json
+    from security_utils import atomic_write_json, read_json_safe
 except ImportError:  # pragma: no cover
     # 当以 python -m scripts.data_modules... 形式运行
-    from scripts.security_utils import atomic_write_json
+    from scripts.security_utils import atomic_write_json, read_json_safe
 
 SNAPSHOT_VERSION = "1.2"
 
@@ -73,7 +72,9 @@ class SnapshotManager:
         with lock:
             if not path.exists():
                 return None
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = read_json_safe(path, default=None, auto_repair=True, backup_on_repair=False)
+            if not isinstance(data, dict):
+                return None
         version = str(data.get("version", ""))
         if version != self.version:
             raise SnapshotVersionMismatch(self.version, version)

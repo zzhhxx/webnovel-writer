@@ -12,13 +12,16 @@ These helpers provide a single, consistent way to locate the active project root
 
 from __future__ import annotations
 
-import json
 import os
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Optional
 
 from runtime_compat import normalize_windows_path
+try:
+    from security_utils import read_json_safe, read_text_safe
+except ImportError:  # pragma: no cover
+    from scripts.security_utils import read_json_safe, read_text_safe
 
 
 DEFAULT_PROJECT_DIR_NAMES: tuple[str, ...] = ("webnovel-project",)
@@ -85,10 +88,7 @@ def _default_registry() -> dict:
 def _load_global_registry(path: Path) -> dict:
     if not path.is_file():
         return _default_registry()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8") or "{}")
-    except Exception:
-        return _default_registry()
+    data = read_json_safe(path, default=_default_registry(), auto_repair=True, backup_on_repair=False)
     if not isinstance(data, dict):
         return _default_registry()
 
@@ -253,6 +253,11 @@ def _is_project_root(path: Path) -> bool:
     return (path / ".webnovel" / "state.json").is_file()
 
 
+def _is_project_workspace_root(path: Path) -> bool:
+    """兼容仅初始化到 `.webnovel/` 目录的工作区（state.json 可能尚未创建）。"""
+    return (path / ".webnovel").is_dir()
+
+
 def _pointer_candidates(cwd: Path, *, stop_at: Optional[Path] = None) -> Iterable[Path]:
     """Yield candidate pointer files from cwd up to parents (bounded by stop_at when provided)."""
     for candidate in (cwd, *cwd.parents):
@@ -272,7 +277,7 @@ def _resolve_project_root_from_pointer(cwd: Path, *, stop_at: Optional[Path] = N
     for pointer_file in _pointer_candidates(cwd, stop_at=stop_at):
         if not pointer_file.is_file():
             continue
-        raw = pointer_file.read_text(encoding="utf-8").strip()
+        raw = read_text_safe(pointer_file, default="", auto_repair=True, backup_on_repair=False).strip()
         if not raw:
             continue
         target = normalize_windows_path(raw).expanduser()
@@ -349,6 +354,8 @@ def resolve_project_root(explicit_project_root: Optional[str] = None, *, cwd: Op
     if explicit_project_root:
         root = normalize_windows_path(explicit_project_root).expanduser().resolve()
         if _is_project_root(root):
+            return root
+        if _is_project_workspace_root(root):
             return root
 
         # 兼容：显式传入“工作区根目录”（含 `.claude/.webnovel-current-project` 指针）

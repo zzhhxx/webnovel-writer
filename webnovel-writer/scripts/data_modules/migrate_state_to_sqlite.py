@@ -339,7 +339,12 @@ def main():
     # 允许传入“工作区根目录”，统一解析到真正的 book project_root（必须包含 .webnovel/state.json）
     from project_locator import resolve_project_root
 
-    resolved_root = resolve_project_root(args.project_root)
+    try:
+        resolved_root = resolve_project_root(args.project_root)
+    except FileNotFoundError:
+        # 兼容测试/初始化阶段：允许直接传入“尚未初始化为完整项目”的目录。
+        # 此时 migrate_state_to_sqlite 会在读取 state.json 阶段返回空统计。
+        resolved_root = Path(args.project_root).expanduser().resolve()
     config = DataModulesConfig.from_project_root(resolved_root)
     backup = not args.no_backup
     logger = IndexManager(config)

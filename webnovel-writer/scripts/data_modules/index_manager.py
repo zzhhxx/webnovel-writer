@@ -626,12 +626,69 @@ class IndexManager(IndexChapterMixin, IndexEntityMixin, IndexDebtMixin, IndexRea
     @contextmanager
     def _get_conn(self):
         """获取数据库连接"""
-        conn = sqlite3.connect(str(self.config.index_db))
+        timeout_seconds = getattr(self.config, "sqlite_timeout_seconds", 15.0)
+        try:
+            timeout_seconds = float(timeout_seconds)
+            if timeout_seconds <= 0:
+                timeout_seconds = 15.0
+        except (TypeError, ValueError):
+            timeout_seconds = 15.0
+
+        conn = sqlite3.connect(str(self.config.index_db), timeout=timeout_seconds)
         conn.row_factory = sqlite3.Row
+        self._configure_sqlite_connection(conn)
         try:
             yield conn
         finally:
             conn.close()
+
+    def _configure_sqlite_connection(self, conn: sqlite3.Connection) -> None:
+        """
+        配置 SQLite 连接级参数，降低并发写冲突并强化约束一致性。
+
+        说明：
+        - 参数异常时采用保守降级，避免影响主流程可用性。
+        """
+        # 1) 外键约束（默认开启）
+        enable_fk = getattr(self.config, "sqlite_foreign_keys", True)
+        if bool(enable_fk):
+            try:
+                conn.execute("PRAGMA foreign_keys = ON")
+            except sqlite3.DatabaseError:
+                pass
+
+        # 2) 写锁等待时间（毫秒）
+        busy_timeout_ms = getattr(self.config, "sqlite_busy_timeout_ms", 5000)
+        try:
+            busy_timeout_ms = int(busy_timeout_ms)
+            if busy_timeout_ms < 0:
+                busy_timeout_ms = 5000
+        except (TypeError, ValueError):
+            busy_timeout_ms = 5000
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {busy_timeout_ms}")
+        except sqlite3.DatabaseError:
+            pass
+
+        # 3) 日志模式（优先 WAL）
+        journal_mode = str(getattr(self.config, "sqlite_journal_mode", "WAL") or "WAL").upper()
+        allowed_journal = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+        if journal_mode not in allowed_journal:
+            journal_mode = "WAL"
+        try:
+            conn.execute(f"PRAGMA journal_mode = {journal_mode}")
+        except sqlite3.DatabaseError:
+            pass
+
+        # 4) 同步级别（WAL 推荐 NORMAL）
+        synchronous = str(getattr(self.config, "sqlite_synchronous", "NORMAL") or "NORMAL").upper()
+        allowed_sync = {"OFF", "NORMAL", "FULL", "EXTRA"}
+        if synchronous not in allowed_sync:
+            synchronous = "NORMAL"
+        try:
+            conn.execute(f"PRAGMA synchronous = {synchronous}")
+        except sqlite3.DatabaseError:
+            pass
 
     # ==================== 章节操作 ====================
 
@@ -1210,6 +1267,14 @@ def main():
 
     elif args.command == "save-review-metrics":
         data = load_json_arg(args.data)
+        # 先触发一次 state 读取，确保历史 BOM/本地编码可自动修复，
+        # 即便后续参数校验失败提前返回，也不会遗留不可读 state.json。
+        _ = read_json_safe(
+            manager.config.state_file,
+            default={},
+            auto_repair=True,
+            backup_on_repair=False,
+        )
         report_file = str(data.get("report_file", "") or "").strip()
         if not report_file:
             emit_error("MISSING_REPORT_FILE", "save-review-metrics 需要 report_file 字段")

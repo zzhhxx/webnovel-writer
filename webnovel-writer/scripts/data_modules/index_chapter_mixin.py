@@ -152,10 +152,11 @@ class IndexChapterMixin:
         with self._get_conn() as conn:
             cursor = conn.cursor()
 
-            # 防止写入孤儿记录：实体不存在时直接跳过
-            cursor.execute("SELECT 1 FROM entities WHERE id = ? LIMIT 1", (entity_id,))
-            if cursor.fetchone() is None:
-                return False
+            require_existing = bool(getattr(self.config, "appearance_require_existing_entity", False))
+            if require_existing:
+                cursor.execute("SELECT 1 FROM entities WHERE id = ? LIMIT 1", (entity_id,))
+                if cursor.fetchone() is None:
+                    return False
 
             if skip_if_exists:
                 # 先检查是否已存在

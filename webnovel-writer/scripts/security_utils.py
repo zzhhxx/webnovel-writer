@@ -443,10 +443,148 @@ def atomic_write_json(
                 pass
 
 
+def atomic_write_text(
+    file_path: Union[str, Path],
+    text: str,
+    *,
+    use_lock: bool = True,
+    backup: bool = True,
+    newline: Optional[str] = None,
+) -> None:
+    """
+    原子化写入文本文件（UTF-8）。
+
+    Args:
+        file_path: 目标文件路径
+        text: 要写入的文本内容
+        use_lock: 是否使用文件锁
+        backup: 是否备份原文件（.bak）
+        newline: 文本换行策略（默认保持平台行为）
+    """
+    file_path = Path(file_path)
+    parent_dir = file_path.parent
+    parent_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_path = file_path.with_suffix(file_path.suffix + '.lock')
+    backup_path = file_path.with_suffix(file_path.suffix + '.bak')
+
+    fd, temp_path = tempfile.mkstemp(
+        suffix='.tmp',
+        prefix=file_path.stem + '_',
+        dir=parent_dir
+    )
+
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline=newline) as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+
+        lock = None
+        if use_lock and HAS_FILELOCK:
+            lock = FileLock(str(lock_path), timeout=10)
+            lock.acquire()
+
+        try:
+            if backup and file_path.exists():
+                try:
+                    import shutil
+                    shutil.copy2(file_path, backup_path)
+                except OSError:
+                    pass
+
+            os.replace(temp_path, file_path)
+            temp_path = None
+        finally:
+            if lock is not None:
+                lock.release()
+
+    except Exception as e:
+        raise AtomicWriteError(f"原子写入文本失败: {e}")
+
+    finally:
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+
+def read_text_safe(
+    file_path: Union[str, Path],
+    default: str = "",
+    *,
+    auto_repair: bool = True,
+    backup_on_repair: bool = True,
+) -> str:
+    """
+    安全读取文本文件；可识别常见历史编码并自动修复回 UTF-8（无 BOM）。
+
+    Args:
+        file_path: 文件路径
+        default: 读取失败时返回值
+        auto_repair: 是否自动回写为 UTF-8
+        backup_on_repair: 自动修复时是否备份原文件（.bak）
+    """
+    file_path = Path(file_path)
+    if not file_path.exists():
+        return default
+
+    try:
+        raw = file_path.read_bytes()
+    except OSError as e:
+        print(f"⚠️ 读取文本失败 ({file_path}): {e}", file=sys.stderr)
+        return default
+
+    last_error: Optional[Exception] = None
+    for encoding in ("utf-8", "utf-8-sig", "gb18030", "gbk", "big5"):
+        try:
+            decoded_text = raw.decode(encoding)
+        except UnicodeDecodeError as e:
+            last_error = e
+            continue
+
+        cleaned_text = decoded_text.lstrip("\ufeff")
+        normalized_text = cleaned_text.replace("\r\n", "\n").replace("\r", "\n")
+        needs_repair = (
+            encoding != "utf-8"
+            or raw.startswith(b"\xef\xbb\xbf")
+            or normalized_text != cleaned_text
+        )
+
+        if auto_repair and needs_repair:
+            try:
+                atomic_write_text(
+                    file_path,
+                    normalized_text,
+                    use_lock=False,
+                    backup=backup_on_repair,
+                    newline="",
+                )
+                print(
+                    f"⚠️ 检测到非标准 UTF-8 文本，已自动修复: {file_path} (source={encoding})",
+                    file=sys.stderr,
+                )
+            except Exception as repair_error:
+                print(
+                    f"⚠️ 文本编码已识别但自动修复失败 ({file_path}): {repair_error}",
+                    file=sys.stderr,
+                )
+
+        return normalized_text
+
+    if last_error is not None:
+        print(f"⚠️ 读取文本失败 ({file_path}): {last_error}", file=sys.stderr)
+    return default
+
+
 def read_json_safe(
     file_path: Union[str, Path],
-    default: Optional[Dict[str, Any]] = None
-) -> Dict[str, Any]:
+    default: Optional[Any] = None,
+    *,
+    auto_repair: bool = True,
+    backup_on_repair: bool = True,
+) -> Any:
     """
     安全读取 JSON 文件（带默认值和错误处理）
 
@@ -468,13 +606,49 @@ def read_json_safe(
         return default
 
     last_error: Optional[Exception] = None
-    for encoding in ("utf-8-sig", "utf-8", "gb18030", "gbk"):
+    raw: bytes
+    try:
+        raw = file_path.read_bytes()
+    except OSError as e:
+        print(f"⚠️ 读取 JSON 失败 ({file_path}): {e}", file=sys.stderr)
+        return default
+
+    for encoding in ("utf-8", "utf-8-sig", "gb18030", "gbk", "big5"):
         try:
-            with open(file_path, 'r', encoding=encoding) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            decoded_text = raw.decode(encoding)
+            payload = json.loads(decoded_text)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             last_error = e
             continue
+
+        needs_repair = False
+        if encoding != "utf-8":
+            needs_repair = True
+        elif raw.startswith(b"\xef\xbb\xbf"):
+            # 理论上 utf-8 分支不会命中 BOM（通常会先触发 JSON 解析失败）；
+            # 保留这段用于防御性兜底。
+            needs_repair = True
+
+        if auto_repair and needs_repair:
+            try:
+                # 统一回写为 UTF-8（无 BOM），并保留备份
+                atomic_write_json(
+                    file_path,
+                    payload,
+                    use_lock=False,
+                    backup=backup_on_repair,
+                )
+                print(
+                    f"⚠️ 检测到非标准 UTF-8 JSON，已自动修复: {file_path} (source={encoding})",
+                    file=sys.stderr,
+                )
+            except Exception as repair_error:
+                print(
+                    f"⚠️ JSON 编码已识别但自动修复失败 ({file_path}): {repair_error}",
+                    file=sys.stderr,
+                )
+
+        return payload
 
     if last_error is not None:
         print(f"⚠️ 读取 JSON 失败 ({file_path}): {last_error}", file=sys.stderr)

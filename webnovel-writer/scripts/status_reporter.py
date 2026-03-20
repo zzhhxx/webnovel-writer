@@ -89,6 +89,10 @@ from collections import defaultdict
 from project_locator import resolve_project_root
 from chapter_paths import extract_chapter_num_from_filename
 from runtime_compat import enable_windows_utf8_stdio
+try:
+    from security_utils import read_json_safe, read_text_safe
+except ImportError:  # pragma: no cover
+    from scripts.security_utils import read_json_safe, read_text_safe
 
 # 导入配置
 try:
@@ -157,9 +161,15 @@ class StatusReporter:
             print(f"❌ 状态文件不存在: {self.state_file}")
             return False
 
-        # 兼容 UTF-8 BOM（utf-8-sig 可同时读取普通 UTF-8）
-        with open(self.state_file, 'r', encoding='utf-8-sig') as f:
-            self.state = json.load(f)
+        self.state = read_json_safe(
+            self.state_file,
+            default=None,
+            auto_repair=True,
+            backup_on_repair=True,
+        )
+        if not isinstance(self.state, dict):
+            print(f"❌ 状态文件读取失败或格式错误: {self.state_file}")
+            return False
 
         if isinstance(self.state, dict):
             self.state = normalize_state_runtime_sections(self.state)
@@ -374,8 +384,14 @@ class StatusReporter:
                 continue
 
             # 读取章节内容
-            with open(chapter_file, 'r', encoding='utf-8') as f:
-                content = f.read()
+            content = read_text_safe(
+                chapter_file,
+                default="",
+                auto_repair=True,
+                backup_on_repair=False,
+            )
+            if not content:
+                continue
 
             # 统计字数（去除 Markdown 标记）
             text = re.sub(r'```[\s\S]*?```', '', content)  # 去除代码块

@@ -1,7 +1,8 @@
 param(
     [ValidateSet("smoke", "full")]
     [string]$Mode = "smoke",
-    [string]$ProjectRoot = ""
+    [string]$ProjectRoot = "",
+    [string]$PythonExe = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,9 +15,21 @@ if ([string]::IsNullOrWhiteSpace($ProjectRoot)) {
 
 Set-Location $ProjectRoot
 
-$pythonExe = ""
-if (-not (Test-Path $pythonExe)) {
-    $pythonExe = "python"
+if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+    $PythonExe = $env:WEBNOVEL_PYTHON
+}
+if ([string]::IsNullOrWhiteSpace($PythonExe)) {
+    $PythonExe = "python"
+}
+if (-not [string]::IsNullOrWhiteSpace($PythonExe)) {
+    # 仅当明显是文件路径时才做 Test-Path，避免对命令名产生误判
+    if ($PythonExe -match "[\\/]|\.exe$") {
+        if (-not (Test-Path $PythonExe)) {
+            Write-Host "Warning: Python path not found: $PythonExe"
+            Write-Host "Fallback to python from PATH."
+            $PythonExe = "python"
+        }
+    }
 }
 
 $scriptRootCandidates = @(
@@ -58,6 +71,9 @@ $ignoreArgs = @()
 $knownBadDirs = @(
     "localtmp",
     "permtemp",
+    "runtime_manual",
+    "runtime_probe",
+    "runtime_tmp",
     "runtime_pytest",
     "tmphkqtr09m",
     "tmpx",
@@ -73,7 +89,7 @@ foreach ($dirName in $knownBadDirs) {
 Write-Host "ProjectRoot: $ProjectRoot"
 Write-Host "TMP/TEMP: $tmpRoot"
 Write-Host "Mode: $Mode"
-Write-Host "Python: $pythonExe"
+Write-Host "Python: $PythonExe"
 Write-Host "ScriptRoot: $scriptRoot"
 Write-Host "TestsRoot: $testsRoot"
 
@@ -93,7 +109,7 @@ except Exception as exc:
 '@ | Set-Variable -Name precheckScript
 $oldEAP = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
-$precheckOutput = $precheckScript | & $pythonExe - 2>&1
+$precheckOutput = $precheckScript | & $PythonExe - 2>&1
 $precheckExitCode = $LASTEXITCODE
 $ErrorActionPreference = $oldEAP
 
@@ -127,17 +143,25 @@ if ($Mode -eq "smoke") {
             throw "Smoke test file not found: $t"
         }
     }
+
     $smokeArgs = @("-m", "pytest", "-q") + $smokeTests + @("--no-cov", "-p", "no:cacheprovider") + $ignoreArgs
     if ($useIsolatedTemp) {
         $smokeArgs += @("--basetemp", $baseTemp)
     }
-    & $pythonExe @smokeArgs
+    & $PythonExe @smokeArgs
     exit $LASTEXITCODE
 }
 
-$fullArgs = @("-m", "pytest", "-q", $testsRoot, "--no-cov", "-p", "no:cacheprovider") + $ignoreArgs
+$fullTestFiles = Get-ChildItem -Path $testsRoot -Filter "test_*.py" -File -ErrorAction SilentlyContinue |
+    Sort-Object FullName |
+    ForEach-Object { $_.FullName }
+if (-not $fullTestFiles -or $fullTestFiles.Count -eq 0) {
+    throw "No test files found under: $testsRoot"
+}
+
+$fullArgs = @("-m", "pytest", "-q") + $fullTestFiles + @("--no-cov", "-p", "no:cacheprovider") + $ignoreArgs
 if ($useIsolatedTemp) {
     $fullArgs += @("--basetemp", $baseTemp)
 }
-& $pythonExe @fullArgs
+& $PythonExe @fullArgs
 exit $LASTEXITCODE
