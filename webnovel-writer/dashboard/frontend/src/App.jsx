@@ -358,15 +358,17 @@ function GraphPage() {
     useEffect(() => {
         Promise.all([
             fetchJSON('/api/relationships', { limit: 1000 }),
+            fetchJSON('/api/relationship-events', { limit: 2000 }),
             fetchJSON('/api/entities'),
-        ]).then(([rels, ents]) => {
-            setRelationships(rels)
+        ]).then(([rels, relEvents, ents]) => {
+            const effectiveRels = buildEffectiveRelationships(rels, relEvents)
+            setRelationships(effectiveRels)
             const typeColors = {
                 '角色': '#4f8ff7', '地点': '#34d399', '星球': '#22d3ee', '神仙': '#f59e0b',
                 '势力': '#8b5cf6', '招式': '#ef4444', '法宝': '#ec4899'
             }
             const relatedIds = new Set()
-            rels.forEach(r => { relatedIds.add(r.from_entity); relatedIds.add(r.to_entity) })
+            effectiveRels.forEach(r => { relatedIds.add(r.from_entity); relatedIds.add(r.to_entity) })
             const entityMap = {}
             ents.forEach(e => { entityMap[e.id] = e })
             const tierWeights = {
@@ -386,7 +388,7 @@ function GraphPage() {
                 val: tierWeights[entityMap[id]?.tier] || 2,
                 color: typeColors[entityMap[id]?.type] || '#5c6078'
             }))
-            const links = rels.map(r => ({
+            const links = effectiveRels.map(r => ({
                 source: r.from_entity,
                 target: r.to_entity,
                 name: r.type
@@ -418,6 +420,58 @@ function GraphPage() {
             </div>
         </>
     )
+}
+
+function buildEffectiveRelationships(relationships, events) {
+    const index = new Map()
+    const rows = Array.isArray(relationships) ? relationships : []
+    const eventRows = Array.isArray(events) ? events : []
+
+    rows.forEach(row => {
+        const from = row?.from_entity
+        const to = row?.to_entity
+        const type = row?.type
+        if (!from || !to || !type) return
+        const key = `${from}::${to}::${type}`
+        index.set(key, {
+            from_entity: from,
+            to_entity: to,
+            type,
+            chapter: Number(row?.chapter) || 0,
+            description: row?.description || '',
+        })
+    })
+
+    eventRows
+        .slice()
+        .sort((a, b) => {
+            const chapterDiff = (Number(a?.chapter) || 0) - (Number(b?.chapter) || 0)
+            if (chapterDiff !== 0) return chapterDiff
+            return (Number(a?.id) || 0) - (Number(b?.id) || 0)
+        })
+        .forEach(row => {
+            const from = row?.from_entity
+            const to = row?.to_entity
+            const type = row?.type
+            if (!from || !to || !type) return
+
+            const key = `${from}::${to}::${type}`
+            const action = String(row?.action || 'update').toLowerCase()
+            if (action === 'remove') {
+                index.delete(key)
+                return
+            }
+
+            index.set(key, {
+                from_entity: from,
+                to_entity: to,
+                type,
+                chapter: Number(row?.chapter) || 0,
+                description: row?.description || '',
+            })
+        })
+
+    return [...index.values()].sort((a, b) => (Number(b?.chapter) || 0) - (Number(a?.chapter) || 0))
 }
 
 

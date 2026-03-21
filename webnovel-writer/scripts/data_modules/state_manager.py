@@ -15,6 +15,8 @@ v5.1 变更（v5.4 沿用）:
 
 import json
 import logging
+import re
+import sqlite3
 import sys
 import time
 from copy import deepcopy
@@ -34,10 +36,10 @@ logger = logging.getLogger(__name__)
 
 try:
     # 当 scripts 目录在 sys.path 中（常见：从 scripts/ 运行）
-    from security_utils import atomic_write_json, read_json_safe
+    from security_utils import atomic_write_json, read_json_safe, read_text_safe
 except ImportError:  # pragma: no cover
     # 当以 `python -m scripts.data_modules...` 从仓库根目录运行
-    from scripts.security_utils import atomic_write_json, read_json_safe
+    from scripts.security_utils import atomic_write_json, read_json_safe, read_text_safe
 
 
 @dataclass
@@ -392,6 +394,33 @@ class StateManager:
         except filelock.Timeout:
             raise RuntimeError("无法获取 state.json 文件锁，请稍后重试")
 
+    @staticmethod
+    def _normalize_state_change_key(change: Dict[str, Any], default_chapter: int = 0) -> tuple[str, str, str, str, int]:
+        """生成状态变化去重键（用于避免双路径写入重复）。"""
+        entity_id = str(change.get("entity_id", "") or "").strip()
+        field = str(change.get("field", "") or "").strip()
+        old_value = str(change.get("old", change.get("old_value", "")) or "")
+        new_value = str(change.get("new", change.get("new_value", "")) or "")
+        chapter_raw = change.get("chapter", default_chapter)
+        try:
+            chapter = int(chapter_raw or 0)
+        except (TypeError, ValueError):
+            chapter = int(default_chapter or 0)
+        return (entity_id, field, old_value, new_value, chapter)
+
+    @staticmethod
+    def _normalize_relationship_key(rel: Dict[str, Any], default_chapter: int = 0) -> tuple[str, str, str, int]:
+        """生成关系去重键（用于避免双路径重复 upsert）。"""
+        from_entity = str(rel.get("from", rel.get("from_entity", "")) or "").strip()
+        to_entity = str(rel.get("to", rel.get("to_entity", "")) or "").strip()
+        rel_type = str(rel.get("type", "") or "").strip()
+        chapter_raw = rel.get("chapter", default_chapter)
+        try:
+            chapter = int(chapter_raw or 0)
+        except (TypeError, ValueError):
+            chapter = int(default_chapter or 0)
+        return (from_entity, to_entity, rel_type, chapter)
+
     def _sync_to_sqlite(self) -> bool:
         """同步待处理数据到 SQLite（v5.1 引入，v5.4 沿用）"""
         if not self._sql_state_manager:
@@ -403,6 +432,9 @@ class StateManager:
 
         # 记录已处理的 (entity_id, chapter) 组合，避免重复写入 appearances
         processed_appearances = set()
+        # 记录已处理的状态变化/关系，避免 process_chapter_entities + pending 双写
+        processed_state_changes = set()
+        processed_relationships = set()
 
         if chapter is not None:
             try:
@@ -413,23 +445,103 @@ class StateManager:
                     state_changes=sqlite_data.get("state_changes", []),
                     relationships_new=sqlite_data.get("relationships_new", [])
                 )
-                # 标记已处理的出场记录
+                # 仅将“已真实写入 DB”的记录加入去重集合，避免因前置实体未落库导致数据被误跳过。
+                persisted_appearance_keys: set[tuple[str, int]] = set()
+                persisted_state_change_keys: set[tuple[str, str, str, str, int]] = set()
+                persisted_relationship_keys: set[tuple[str, str, str, int]] = set()
+                try:
+                    with self._sql_state_manager._index_manager._get_conn() as conn:
+                        cursor = conn.cursor()
+                        for row in cursor.execute(
+                            "SELECT entity_id FROM appearances WHERE chapter = ?",
+                            (int(chapter),),
+                        ).fetchall():
+                            entity_id = str(row[0] or "").strip()
+                            if entity_id:
+                                persisted_appearance_keys.add((entity_id, int(chapter)))
+
+                        for row in cursor.execute(
+                            """
+                            SELECT entity_id, field, old_value, new_value, chapter
+                            FROM state_changes
+                            WHERE chapter = ?
+                            """,
+                            (int(chapter),),
+                        ).fetchall():
+                            persisted_state_change_keys.add(
+                                (
+                                    str(row[0] or "").strip(),
+                                    str(row[1] or "").strip(),
+                                    str(row[2] or ""),
+                                    str(row[3] or ""),
+                                    self._to_int(row[4], default=int(chapter)),
+                                )
+                            )
+
+                        for row in cursor.execute(
+                            """
+                            SELECT from_entity, to_entity, type, chapter
+                            FROM relationships
+                            WHERE chapter = ?
+                            """,
+                            (int(chapter),),
+                        ).fetchall():
+                            persisted_relationship_keys.add(
+                                (
+                                    str(row[0] or "").strip(),
+                                    str(row[1] or "").strip(),
+                                    str(row[2] or "").strip(),
+                                    self._to_int(row[3], default=int(chapter)),
+                                )
+                            )
+                except Exception:
+                    # 查询失败时宁可不去重，也不冒数据丢失风险
+                    persisted_appearance_keys = set()
+                    persisted_state_change_keys = set()
+                    persisted_relationship_keys = set()
+
                 for entity in sqlite_data.get("entities_appeared", []):
-                    if entity.get("id"):
-                        processed_appearances.add((entity.get("id"), chapter))
+                    entity_id = str(entity.get("id", "") or "").strip()
+                    key = (entity_id, int(chapter))
+                    if entity_id and key in persisted_appearance_keys:
+                        processed_appearances.add(key)
                 for entity in sqlite_data.get("entities_new", []):
-                    eid = entity.get("suggested_id") or entity.get("id")
-                    if eid:
-                        processed_appearances.add((eid, chapter))
+                    entity_id = str(entity.get("suggested_id") or entity.get("id") or "").strip()
+                    key = (entity_id, int(chapter))
+                    if entity_id and key in persisted_appearance_keys:
+                        processed_appearances.add(key)
+
+                for change in sqlite_data.get("state_changes", []):
+                    if not isinstance(change, dict):
+                        continue
+                    key = self._normalize_state_change_key(change, default_chapter=int(chapter))
+                    if key in persisted_state_change_keys:
+                        processed_state_changes.add(key)
+
+                for rel in sqlite_data.get("relationships_new", []):
+                    if not isinstance(rel, dict):
+                        continue
+                    key = self._normalize_relationship_key(rel, default_chapter=int(chapter))
+                    if key in persisted_relationship_keys:
+                        processed_relationships.add(key)
             except Exception as exc:
                 logger.warning("SQLite sync failed (process_chapter_entities): %s", exc)
                 return False
 
         # 方式2: 使用 add_entity/update_entity 收集的增量数据。
         # 数据缓存在 _pending_entity_patches 等变量中。
-        return self._sync_pending_patches_to_sqlite(processed_appearances)
+        return self._sync_pending_patches_to_sqlite(
+            processed_appearances=processed_appearances,
+            processed_state_changes=processed_state_changes,
+            processed_relationships=processed_relationships,
+        )
 
-    def _sync_pending_patches_to_sqlite(self, processed_appearances: set = None) -> bool:
+    def _sync_pending_patches_to_sqlite(
+        self,
+        processed_appearances: set = None,
+        processed_state_changes: set = None,
+        processed_relationships: set = None,
+    ) -> bool:
         """同步 _pending_entity_patches 等到 SQLite（v5.1 引入，v5.4 沿用）
 
         Args:
@@ -441,13 +553,17 @@ class StateManager:
 
         if processed_appearances is None:
             processed_appearances = set()
+        if processed_state_changes is None:
+            processed_state_changes = set()
+        if processed_relationships is None:
+            processed_relationships = set()
 
         # 元数据字段（不应写入 current_json）
         METADATA_FIELDS = {"canonical_name", "tier", "desc", "is_protagonist", "is_archived"}
 
         try:
             from .sql_state_manager import EntityData
-            from .index_manager import EntityMeta
+            from .index_manager import EntityMeta, RelationshipEventMeta
 
             # 同步实体补丁
             for (entity_type, entity_id), patch in self._pending_entity_patches.items():
@@ -556,6 +672,10 @@ class StateManager:
 
             # 同步状态变化
             for change in self._pending_state_changes:
+                if not isinstance(change, dict):
+                    continue
+                if self._normalize_state_change_key(change) in processed_state_changes:
+                    continue
                 self._sql_state_manager.record_state_change(
                     entity_id=change.get("entity_id", ""),
                     field=change.get("field", ""),
@@ -567,12 +687,32 @@ class StateManager:
 
             # 同步关系
             for rel in self._pending_structured_relationships:
+                if not isinstance(rel, dict):
+                    continue
+                if self._normalize_relationship_key(rel) in processed_relationships:
+                    continue
                 self._sql_state_manager.upsert_relationship(
                     from_entity=rel.get("from_entity", ""),
                     to_entity=rel.get("to_entity", ""),
                     type=rel.get("type", "相识"),
                     description=rel.get("description", ""),
                     chapter=rel.get("chapter", 0)
+                )
+                # pending 补偿路径也记录关系事件，避免 relationship_events 缺失
+                self._sql_state_manager._index_manager.record_relationship_event(
+                    RelationshipEventMeta(
+                        from_entity=str(rel.get("from_entity", "") or ""),
+                        to_entity=str(rel.get("to_entity", "") or ""),
+                        type=str(rel.get("type", "相识") or "相识"),
+                        chapter=self._to_int(rel.get("chapter", 0), default=0),
+                        action=str(rel.get("action", "update") or "update"),
+                        polarity=self._to_int(rel.get("polarity", 0), default=0),
+                        strength=self._to_float(rel.get("strength", 0.5), default=0.5),
+                        description=str(rel.get("description", "") or ""),
+                        scene_index=self._to_int(rel.get("scene_index", 0), default=0),
+                        evidence=str(rel.get("evidence", "") or ""),
+                        confidence=self._to_float(rel.get("confidence", 1.0), default=1.0),
+                    )
                 )
 
             return True
@@ -1193,6 +1333,476 @@ class StateManager:
 
         return warnings
 
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _to_float(value: Any, default: float = 0.0) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _extract_chapter_word_count(self, result: Dict[str, Any]) -> int:
+        """从 Data Agent 结果中提取章节字数（缺失时返回 0）。"""
+        chapter_info = result.get("chapter_info")
+        if not isinstance(chapter_info, dict):
+            chapter_info = {}
+
+        candidates = [
+            result.get("word_count"),
+            result.get("chapter_word_count"),
+            chapter_info.get("word_count"),
+        ]
+        for raw in candidates:
+            count = self._to_int(raw, default=0)
+            if count > 0:
+                return count
+        return 0
+
+    @staticmethod
+    def _extract_markdown_section(text: str, heading: str) -> str:
+        """提取 Markdown 二级标题下的正文块。"""
+        if not text:
+            return ""
+        pattern = rf"##\s*{re.escape(heading)}\s*\n(.+?)(?=\n##|\Z)"
+        match = re.search(pattern, text, flags=re.DOTALL)
+        return str(match.group(1)).strip() if match else ""
+
+    @staticmethod
+    def _extract_title_from_chapter_filename(filename: str) -> str:
+        """从章节文件名提取标题（如：第001章-标题.md）。"""
+        match = re.match(r"^第0*\d+章(?:[-—_ ]+(?P<title>.+?))?\.md$", filename.strip())
+        if not match:
+            return ""
+        return str(match.group("title") or "").strip()
+
+    @staticmethod
+    def _extract_title_from_markdown(text: str, chapter: int) -> str:
+        """从章节正文首个标题提取章节名。"""
+        if not text:
+            return ""
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("#"):
+                continue
+            raw_title = re.sub(r"^#+\s*", "", stripped).strip()
+            if not raw_title:
+                continue
+            raw_title = re.sub(rf"^第0*{int(chapter)}章[\s：:：\-—_]*", "", raw_title).strip()
+            return raw_title
+        return ""
+
+    @staticmethod
+    def _estimate_markdown_word_count(text: str) -> int:
+        """估算正文字符数（用于填充 chapters.word_count）。"""
+        if not text:
+            return 0
+        body = re.sub(r"```[\s\S]*?```", "", text)
+        body = re.sub(r"^#{1,6}\s+.*$", "", body, flags=re.MULTILINE)
+        body = re.sub(r"^\s*[-*_]{3,}\s*$", "", body, flags=re.MULTILINE)
+        body = re.sub(r"\s+", "", body)
+        return max(0, len(body))
+
+    @staticmethod
+    def _excerpt_plain_text(text: str, max_chars: int = 180) -> str:
+        """提取简短纯文本摘要。"""
+        if not text:
+            return ""
+        body = re.sub(r"```[\s\S]*?```", "", text)
+        body = re.sub(r"^#{1,6}\s+.*$", "", body, flags=re.MULTILINE)
+        lines = [line.strip() for line in body.splitlines() if line.strip()]
+        if not lines:
+            return ""
+        plain = " ".join(lines).strip()
+        return plain[: max(20, int(max_chars))]
+
+    def _collect_backfill_candidate_chapters(self, index_manager) -> Dict[int, set[str]]:
+        """收集可用于回填的章节号及来源。"""
+        candidates: Dict[int, set[str]] = {}
+
+        def _add(chapter_value: Any, source: str) -> None:
+            chapter = self._to_int(chapter_value, default=0)
+            if chapter <= 0:
+                return
+            candidates.setdefault(chapter, set()).add(source)
+
+        # 来源1：正文文件
+        try:
+            from chapter_paths import extract_chapter_num_from_filename
+        except ImportError:  # pragma: no cover
+            from scripts.chapter_paths import extract_chapter_num_from_filename
+
+        chapters_dir = self.config.chapters_dir
+        if chapters_dir.exists():
+            for chapter_file in chapters_dir.rglob("第*.md"):
+                chapter_num = extract_chapter_num_from_filename(chapter_file.name)
+                if chapter_num:
+                    _add(chapter_num, "chapter_file")
+
+        # 来源2：摘要文件
+        summaries_dir = self.config.webnovel_dir / "summaries"
+        if summaries_dir.exists():
+            for summary_file in summaries_dir.glob("ch*.md"):
+                match = re.match(r"^ch0*(\d+)\.md$", summary_file.name.lower())
+                if match:
+                    _add(match.group(1), "summary_file")
+
+        # 来源3：state.chapter_meta
+        chapter_meta = self._state.get("chapter_meta", {})
+        if isinstance(chapter_meta, dict):
+            for key in chapter_meta.keys():
+                _add(key, "state.chapter_meta")
+
+        # 来源4：当前进度章节（至少确保当前章可见）
+        progress = self._state.get("progress", {})
+        if isinstance(progress, dict):
+            _add(progress.get("current_chapter"), "state.progress")
+
+        # 来源5：SQLite 现有章节信号（允许缺少某些表）
+        table_sources = [
+            ("chapters", "db.chapters"),
+            ("scenes", "db.scenes"),
+            ("appearances", "db.appearances"),
+            ("chapter_reading_power", "db.chapter_reading_power"),
+        ]
+        try:
+            with index_manager._get_conn() as conn:
+                for table_name, source_name in table_sources:
+                    try:
+                        rows = conn.execute(f"SELECT DISTINCT chapter FROM {table_name}").fetchall()
+                    except sqlite3.OperationalError:
+                        continue
+                    for row in rows:
+                        _add(row[0], source_name)
+        except Exception:
+            # 回填是 best-effort，DB 异常时保留已有文件/state来源
+            pass
+
+        return candidates
+
+    def _build_backfill_chapter_payload(self, chapter: int, sources: set[str], index_manager) -> Dict[str, Any]:
+        """根据已有信号推断单章 ChapterMeta 字段。"""
+        try:
+            from chapter_paths import find_chapter_file
+        except ImportError:  # pragma: no cover
+            from scripts.chapter_paths import find_chapter_file
+
+        chapter_file = find_chapter_file(self.config.project_root, int(chapter))
+        chapter_text = ""
+        if chapter_file and chapter_file.exists():
+            chapter_text = read_text_safe(
+                chapter_file,
+                default="",
+                auto_repair=False,
+                backup_on_repair=False,
+            )
+
+        summary_path = self.config.webnovel_dir / "summaries" / f"ch{int(chapter):04d}.md"
+        summary_text = ""
+        if summary_path.exists():
+            summary_text = read_text_safe(
+                summary_path,
+                default="",
+                auto_repair=False,
+                backup_on_repair=False,
+            )
+
+        chapter_meta: Dict[str, Any] = {}
+        raw_chapter_meta = self._state.get("chapter_meta", {})
+        if isinstance(raw_chapter_meta, dict):
+            for key in (str(int(chapter)).zfill(4), str(int(chapter))):
+                value = raw_chapter_meta.get(key)
+                if isinstance(value, dict):
+                    chapter_meta = value
+                    break
+
+        title = str(
+            chapter_meta.get("title")
+            or chapter_meta.get("chapter_title")
+            or chapter_meta.get("name")
+            or ""
+        ).strip()
+        if not title and chapter_file:
+            title = self._extract_title_from_chapter_filename(chapter_file.name)
+        if not title:
+            title = self._extract_title_from_markdown(chapter_text, int(chapter))
+
+        location = str(
+            chapter_meta.get("location")
+            or chapter_meta.get("chapter_location")
+            or chapter_meta.get("scene_location")
+            or ""
+        ).strip()
+        if not location:
+            ending = chapter_meta.get("ending")
+            if isinstance(ending, dict):
+                location = str(ending.get("location") or "").strip()
+
+        summary = str(
+            chapter_meta.get("summary")
+            or chapter_meta.get("chapter_summary")
+            or ""
+        ).strip()
+        if not summary and summary_text:
+            summary = self._extract_markdown_section(summary_text, "剧情摘要")
+            if not summary:
+                summary = self._excerpt_plain_text(summary_text, max_chars=220)
+        if not summary and chapter_text:
+            summary = self._extract_markdown_section(chapter_text, "本章摘要")
+        if not summary:
+            summary = self._excerpt_plain_text(chapter_text, max_chars=220)
+
+        word_count = self._to_int(
+            chapter_meta.get("word_count", chapter_meta.get("chapter_word_count")),
+            default=0,
+        )
+        if word_count <= 0:
+            word_count = self._estimate_markdown_word_count(chapter_text)
+
+        characters: List[str] = []
+        try:
+            with index_manager._get_conn() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT entity_id
+                    FROM appearances
+                    WHERE chapter = ?
+                    ORDER BY confidence DESC, entity_id ASC
+                    """,
+                    (int(chapter),),
+                ).fetchall()
+                seen = set()
+                for row in rows:
+                    entity_id = str(row[0] or "").strip()
+                    if not entity_id or entity_id in seen:
+                        continue
+                    seen.add(entity_id)
+                    characters.append(entity_id)
+        except Exception:
+            characters = []
+
+        if not characters:
+            raw_chars = chapter_meta.get("characters")
+            if isinstance(raw_chars, list):
+                characters = [str(v).strip() for v in raw_chars if str(v).strip()]
+
+        return {
+            "chapter": int(chapter),
+            "sources": sorted(sources),
+            "title": title,
+            "location": location,
+            "word_count": max(0, int(word_count or 0)),
+            "characters": characters,
+            "summary": summary,
+        }
+
+    def backfill_missing_chapter_index(
+        self,
+        *,
+        from_chapter: Optional[int] = None,
+        to_chapter: Optional[int] = None,
+        dry_run: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        回填 index.db 中缺失的 chapters 行（best-effort）。
+
+        数据源（按可用性自动组合）：
+        - 正文章节文件（正文/）
+        - .webnovel/summaries/chNNNN.md
+        - state.json.chapter_meta
+        - SQLite appearances/scenes/chapter_reading_power
+        """
+        try:
+            from .index_manager import IndexManager, ChapterMeta
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(f"无法加载 index_manager: {exc}") from exc
+
+        index_manager = self._sql_state_manager._index_manager if self._sql_state_manager else IndexManager(self.config)
+
+        candidates = self._collect_backfill_candidate_chapters(index_manager)
+        ordered_chapters = sorted(candidates.keys())
+        if from_chapter is not None:
+            ordered_chapters = [ch for ch in ordered_chapters if ch >= int(from_chapter)]
+        if to_chapter is not None:
+            ordered_chapters = [ch for ch in ordered_chapters if ch <= int(to_chapter)]
+
+        existing_chapters = set()
+        with index_manager._get_conn() as conn:
+            for row in conn.execute("SELECT chapter FROM chapters").fetchall():
+                chapter = self._to_int(row[0], default=0)
+                if chapter > 0:
+                    existing_chapters.add(chapter)
+
+        report: Dict[str, Any] = {
+            "dry_run": bool(dry_run),
+            "from_chapter": int(from_chapter) if from_chapter is not None else None,
+            "to_chapter": int(to_chapter) if to_chapter is not None else None,
+            "candidates": len(ordered_chapters),
+            "already_present": 0,
+            "missing": 0,
+            "repaired": 0,
+            "failed": 0,
+            "repaired_chapters": [],
+            "failed_items": [],
+            "preview": [],
+        }
+
+        for chapter in ordered_chapters:
+            if chapter in existing_chapters:
+                report["already_present"] += 1
+                continue
+
+            report["missing"] += 1
+            payload = self._build_backfill_chapter_payload(chapter, candidates.get(chapter, set()), index_manager)
+            report["preview"].append(
+                {
+                    "chapter": int(payload["chapter"]),
+                    "sources": list(payload["sources"]),
+                    "title": payload["title"],
+                    "word_count": int(payload["word_count"]),
+                    "characters": list(payload["characters"]),
+                    "has_summary": bool(payload["summary"]),
+                }
+            )
+
+            if dry_run:
+                continue
+
+            try:
+                index_manager.add_chapter(
+                    ChapterMeta(
+                        chapter=int(payload["chapter"]),
+                        title=str(payload["title"]),
+                        location=str(payload["location"]),
+                        word_count=max(0, int(payload["word_count"])),
+                        characters=list(payload["characters"]),
+                        summary=str(payload["summary"]),
+                    )
+                )
+                report["repaired"] += 1
+                report["repaired_chapters"].append(int(payload["chapter"]))
+            except Exception as exc:
+                report["failed"] += 1
+                report["failed_items"].append(
+                    {"chapter": int(payload["chapter"]), "error": str(exc)}
+                )
+
+        return report
+
+    def _sync_chapter_index_from_result(self, chapter: int, result: Dict[str, Any], word_count: int) -> None:
+        """
+        将章节级元数据落盘到 index.db 的 chapters/scenes。
+
+        说明：
+        - 旧流程常只写实体关系，未写 chapters/scenes，导致 Dashboard 章节视图缺失。
+        - 这里做“尽力写入”：字段缺失时也至少保留 chapter 行，后续可补齐。
+        """
+        if not self._sql_state_manager:
+            return
+
+        try:
+            from .index_manager import ChapterMeta, SceneMeta
+        except Exception:
+            return
+
+        chapter_info = result.get("chapter_info")
+        if not isinstance(chapter_info, dict):
+            chapter_info = {}
+
+        title = str(
+            chapter_info.get("title")
+            or result.get("chapter_title")
+            or result.get("title")
+            or ""
+        ).strip()
+        location = str(
+            chapter_info.get("location")
+            or result.get("chapter_location")
+            or result.get("location")
+            or ""
+        ).strip()
+        if not location:
+            chapter_meta = result.get("chapter_meta")
+            if isinstance(chapter_meta, dict):
+                ending = chapter_meta.get("ending")
+                if isinstance(ending, dict):
+                    location = str(ending.get("location") or "").strip()
+
+        summary = str(
+            chapter_info.get("summary")
+            or result.get("chapter_summary")
+            or ""
+        ).strip()
+
+        characters = []
+        raw_chars = chapter_info.get("characters")
+        if isinstance(raw_chars, list):
+            characters = [str(v).strip() for v in raw_chars if str(v).strip()]
+        if not characters:
+            seen = set()
+            for row in result.get("entities_appeared", []):
+                if not isinstance(row, dict):
+                    continue
+                eid = str(row.get("id", "") or "").strip()
+                if not eid or eid in seen:
+                    continue
+                seen.add(eid)
+                characters.append(eid)
+
+        self._sql_state_manager._index_manager.add_chapter(
+            ChapterMeta(
+                chapter=int(chapter),
+                title=title,
+                location=location,
+                word_count=max(0, int(word_count or 0)),
+                characters=characters,
+                summary=summary,
+            )
+        )
+
+        scenes_raw = result.get("scenes")
+        if not isinstance(scenes_raw, list):
+            scenes_raw = result.get("scene_chunks")
+        if not isinstance(scenes_raw, list) or not scenes_raw:
+            return
+
+        scenes: List[SceneMeta] = []
+        for idx, raw in enumerate(scenes_raw, start=1):
+            if not isinstance(raw, dict):
+                continue
+            scene_index = self._to_int(raw.get("scene_index", raw.get("index", idx)), default=idx)
+            start_line = self._to_int(raw.get("start_line"), default=1)
+            end_line = self._to_int(raw.get("end_line"), default=max(start_line, 1))
+            if end_line < start_line:
+                end_line = start_line
+            scene_location = str(raw.get("location") or location or "").strip()
+            scene_summary = str(raw.get("summary") or raw.get("content") or "").strip()
+            raw_scene_chars = raw.get("characters")
+            if isinstance(raw_scene_chars, list):
+                scene_chars = [str(v).strip() for v in raw_scene_chars if str(v).strip()]
+            else:
+                scene_chars = []
+
+            scenes.append(
+                SceneMeta(
+                    chapter=int(chapter),
+                    scene_index=max(1, int(scene_index)),
+                    start_line=max(1, int(start_line)),
+                    end_line=max(1, int(end_line)),
+                    location=scene_location,
+                    summary=scene_summary,
+                    characters=scene_chars,
+                )
+            )
+
+        if scenes:
+            self._sql_state_manager._index_manager.add_scenes(int(chapter), scenes)
+
     def process_chapter_result(self, chapter: int, result: Dict) -> List[str]:
         """
         处理 Data Agent 的章节处理结果（v5.1 引入，v5.4 沿用）
@@ -1273,8 +1883,11 @@ class StateManager:
             self._state["chapter_meta"][meta_key] = chapter_meta
             self._pending_chapter_meta[meta_key] = chapter_meta
 
-        # 更新进度
-        self.update_progress(chapter)
+        chapter_word_count = self._extract_chapter_word_count(result)
+        # 更新进度（若 Data Agent 提供字数则同步 total_words）
+        self.update_progress(chapter, words=chapter_word_count)
+        # 补充章节级索引（chapters/scenes）
+        self._sync_chapter_index_from_result(chapter, result, chapter_word_count)
 
         # 同步主角状态（entities_v3 → protagonist_state）
         self.sync_protagonist_from_entity()
@@ -1435,6 +2048,12 @@ def main():
     process_parser.add_argument("--chapter", type=int, required=True, help="章节号")
     process_parser.add_argument("--data", required=True, help="JSON 格式的处理结果")
 
+    # 回填缺失章节索引
+    backfill_parser = subparsers.add_parser("backfill-missing")
+    backfill_parser.add_argument("--from-chapter", type=int, help="起始章节（含）")
+    backfill_parser.add_argument("--to-chapter", type=int, help="结束章节（含）")
+    backfill_parser.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
+
     argv = normalize_global_project_root(sys.argv[1:])
     args = parser.parse_args(argv)
     command_started_at = time.perf_counter()
@@ -1535,6 +2154,40 @@ def main():
             )
             return
         emit_success({"chapter": args.chapter, "warnings": warnings}, message="chapter_processed", chapter=args.chapter)
+
+    elif args.command == "backfill-missing":
+        from_chapter = args.from_chapter
+        to_chapter = args.to_chapter
+        if (
+            from_chapter is not None
+            and to_chapter is not None
+            and int(from_chapter) > int(to_chapter)
+        ):
+            emit_error(
+                "INVALID_RANGE",
+                f"章节范围无效: from_chapter={from_chapter} > to_chapter={to_chapter}",
+                suggestion="请调整为 from_chapter <= to_chapter",
+            )
+            return
+
+        try:
+            report = manager.backfill_missing_chapter_index(
+                from_chapter=from_chapter,
+                to_chapter=to_chapter,
+                dry_run=bool(args.dry_run),
+            )
+        except Exception as exc:
+            emit_error(
+                "BACKFILL_FAILED",
+                f"回填失败: {exc}",
+                suggestion="可先使用 --dry-run 预览待修复章节。",
+            )
+            return
+
+        emit_success(
+            report,
+            message="backfill_preview" if args.dry_run else "backfill_done",
+        )
 
     else:
         emit_error("UNKNOWN_COMMAND", "未指定有效命令", suggestion="请查看 --help")

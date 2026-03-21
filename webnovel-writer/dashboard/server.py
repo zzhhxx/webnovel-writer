@@ -12,9 +12,25 @@ import sys
 import webbrowser
 from pathlib import Path
 
+try:
+    # 与 scripts 侧保持一致的 project_root 解析（支持 workspace pointer / registry）
+    from project_locator import resolve_project_root as resolve_project_root_safely
+except ImportError:  # pragma: no cover
+    try:
+        from scripts.project_locator import resolve_project_root as resolve_project_root_safely
+    except ImportError:  # pragma: no cover
+        resolve_project_root_safely = None
+
 
 def _resolve_project_root(cli_root: str | None) -> Path:
     """按优先级解析 PROJECT_ROOT：CLI > 环境变量 > .claude 指针 > CWD。"""
+    if resolve_project_root_safely is not None:
+        try:
+            return resolve_project_root_safely(cli_root, cwd=Path.cwd())
+        except Exception:
+            # 回退到 dashboard 自带的轻量解析逻辑
+            pass
+
     if cli_root:
         return Path(cli_root).resolve()
 

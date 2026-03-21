@@ -201,17 +201,27 @@ def test_process_chapter_result_and_sqlite_sync(temp_project):
             },
         ],
         "chapter_meta": {"hook": "test", "end": "ok"},
+        "title": "试炼开端",
+        "chapter_location": "天云宗",
+        "word_count": 1800,
     }
     warnings = manager.process_chapter_result(12, result)
     assert any("需人工确认" in w for w in warnings)
     assert any("消歧警告" in w for w in warnings)
 
     manager.save_state()
+    assert int(manager._state.get("progress", {}).get("total_words") or 0) == 1800
 
     idx = IndexManager(temp_project)
     assert idx.get_entity("yaolao") is not None
     assert idx.get_relationship_between("xiaoyan", "yaolao")
-    assert idx.get_entity_state_changes("xiaoyan")
+    # process_chapter_entities 与 pending 同步不应重复写入 state_changes
+    state_changes = idx.get_entity_state_changes("xiaoyan")
+    assert len(state_changes) == 1
+    chapter_meta = idx.get_chapter(12)
+    assert chapter_meta is not None
+    assert chapter_meta.get("title") == "试炼开端"
+    assert int(chapter_meta.get("word_count") or 0) == 1800
 
     by_type = manager.get_entities_by_type("角色")
     by_tier = manager.get_entities_by_tier("核心")
@@ -578,6 +588,101 @@ def test_state_manager_cli_commands(temp_project, monkeypatch, capsys):
         payload,
     ])
     assert out["status"] == "success"
+
+
+def test_state_manager_cli_backfill_missing(temp_project, monkeypatch, capsys):
+    chapter_file = temp_project.project_root / "正文" / "第0001章-测试标题.md"
+    chapter_file.parent.mkdir(parents=True, exist_ok=True)
+    chapter_file.write_text(
+        "# 第1章：测试标题\n\n## 本章摘要\n主角正式登场。\n\n正文内容一二三四五六七八九十。",
+        encoding="utf-8",
+    )
+
+    summary_file = temp_project.project_root / ".webnovel" / "summaries" / "ch0001.md"
+    summary_file.parent.mkdir(parents=True, exist_ok=True)
+    summary_file.write_text("## 剧情摘要\n这是第1章的摘要。", encoding="utf-8")
+
+    idx = IndexManager(temp_project)
+    idx.upsert_entity(
+        EntityMeta(
+            id="xiaoyan",
+            type="角色",
+            canonical_name="萧炎",
+            tier="核心",
+            current={},
+            first_appearance=1,
+            last_appearance=1,
+            is_protagonist=True,
+        )
+    )
+    idx.record_appearance("xiaoyan", 1, ["萧炎"], 0.95)
+    assert idx.get_chapter(1) is None
+
+    def run_cli(args):
+        monkeypatch.setattr(sys, "argv", args)
+        from data_modules import state_manager as sm
+
+        sm.main()
+        out = capsys.readouterr().out
+        return json.loads(out)
+
+    dry_run = run_cli(
+        [
+            "state_manager",
+            "--project-root",
+            str(temp_project.project_root),
+            "backfill-missing",
+            "--dry-run",
+        ]
+    )
+    assert dry_run["status"] == "success"
+    assert dry_run.get("data", {}).get("dry_run") is True
+    assert dry_run.get("data", {}).get("missing", 0) >= 1
+    assert any(item.get("chapter") == 1 for item in dry_run.get("data", {}).get("preview", []))
+    assert idx.get_chapter(1) is None
+
+    applied = run_cli(
+        [
+            "state_manager",
+            "--project-root",
+            str(temp_project.project_root),
+            "backfill-missing",
+        ]
+    )
+    assert applied["status"] == "success"
+    assert applied.get("data", {}).get("dry_run") is False
+    assert applied.get("data", {}).get("repaired", 0) >= 1
+    chapter = idx.get_chapter(1)
+    assert chapter is not None
+    assert chapter.get("title") == "测试标题"
+    assert int(chapter.get("word_count") or 0) > 0
+    assert "xiaoyan" in (chapter.get("characters") or [])
+    assert chapter.get("summary", "").strip() != ""
+
+
+def test_state_manager_cli_backfill_invalid_range(temp_project, monkeypatch, capsys):
+    def run_cli(args):
+        monkeypatch.setattr(sys, "argv", args)
+        from data_modules import state_manager as sm
+
+        sm.main()
+        out = capsys.readouterr().out
+        return json.loads(out)
+
+    out = run_cli(
+        [
+            "state_manager",
+            "--project-root",
+            str(temp_project.project_root),
+            "backfill-missing",
+            "--from-chapter",
+            "10",
+            "--to-chapter",
+            "2",
+        ]
+    )
+    assert out["status"] == "error"
+    assert out.get("error", {}).get("code") == "INVALID_RANGE"
 
 
 def test_save_state_timeout(monkeypatch, temp_project):

@@ -9,7 +9,6 @@ import asyncio
 import json
 import time
 from pathlib import Path
-from typing import AsyncGenerator
 
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -18,7 +17,8 @@ from watchdog.events import FileSystemEventHandler
 class _WebnovelFileHandler(FileSystemEventHandler):
     """仅关注 .webnovel/ 目录下关键文件的修改/创建事件。"""
 
-    WATCH_NAMES = {"state.json", "index.db", "workflow_state.json"}
+    WATCH_NAMES = {"state.json", "workflow_state.json"}
+    INDEX_DB_PREFIX = "index.db"
 
     def __init__(self, notify_callback, watch_root: Path, extra_roots: list[Path] | None = None):
         super().__init__()
@@ -39,8 +39,12 @@ class _WebnovelFileHandler(FileSystemEventHandler):
             return False
 
     def _should_notify(self, file_path: Path) -> bool:
-        name = file_path.name
+        name = file_path.name.lower()
         if name in self.WATCH_NAMES:
+            return True
+        # SQLite WAL 模式写入通常落在 index.db-wal / index.db-shm。
+        # 只监听 index.db 会导致数据库更新后前端不刷新。
+        if name == self.INDEX_DB_PREFIX or name.startswith(f"{self.INDEX_DB_PREFIX}-"):
             return True
 
         resolved = file_path.resolve()
@@ -106,14 +110,20 @@ class FileWatcher:
             self._loop.call_soon_threadsafe(self._dispatch, msg)
 
     def _dispatch(self, msg: str):
-        dead: list[asyncio.Queue] = []
-        for q in self._subscribers:
+        for q in list(self._subscribers):
             try:
                 q.put_nowait(msg)
             except asyncio.QueueFull:
-                dead.append(q)
-        for dq in dead:
-            self.unsubscribe(dq)
+                # 高频事件下保留订阅，丢弃最旧消息，保证前端至少收到最新变更。
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(msg)
+                except asyncio.QueueFull:
+                    # 极端并发下允许本次消息丢弃，但不移除订阅。
+                    pass
 
     # --- 生命周期 ---
 

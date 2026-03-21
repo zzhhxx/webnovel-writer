@@ -14,6 +14,7 @@ webnovel 统一入口（面向 skills / agents 的稳定 CLI）
   python "<SCRIPTS_DIR>/webnovel.py" use D:\\wk\\xiaoshuo\\凡人资本论
   python "<SCRIPTS_DIR>/webnovel.py" --project-root D:\\wk\\xiaoshuo index stats
   python "<SCRIPTS_DIR>/webnovel.py" --project-root D:\\wk\\xiaoshuo state process-chapter --chapter 100 --data @payload.json
+  python "<SCRIPTS_DIR>/webnovel.py" --project-root D:\\wk\\xiaoshuo backfill-missing --dry-run
   python "<SCRIPTS_DIR>/webnovel.py" --project-root D:\\wk\\xiaoshuo extract-context --chapter 100 --format json
 
 也支持（不推荐，容易踩 PYTHONPATH/cd/参数顺序坑）：
@@ -211,6 +212,11 @@ def main() -> None:
     p_state = sub.add_parser("state", help="转发到 state_manager")
     p_state.add_argument("args", nargs=argparse.REMAINDER)
 
+    p_backfill = sub.add_parser("backfill-missing", help="补齐缺失章节索引（转发到 state_manager backfill-missing）")
+    p_backfill.add_argument("--from-chapter", type=int, help="起始章节（含）")
+    p_backfill.add_argument("--to-chapter", type=int, help="结束章节（含）")
+    p_backfill.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
+
     p_rag = sub.add_parser("rag", help="转发到 rag_adapter")
     p_rag.add_argument("args", nargs=argparse.REMAINDER)
 
@@ -282,6 +288,15 @@ def main() -> None:
         raise SystemExit(_run_data_module("index_manager", [*forward_args, *rest]))
     if tool == "state":
         raise SystemExit(_run_data_module("state_manager", [*forward_args, *rest]))
+    if tool == "backfill-missing":
+        backfill_args = [*forward_args, "backfill-missing"]
+        if args.dry_run:
+            backfill_args.append("--dry-run")
+        if args.from_chapter is not None:
+            backfill_args.extend(["--from-chapter", str(args.from_chapter)])
+        if args.to_chapter is not None:
+            backfill_args.extend(["--to-chapter", str(args.to_chapter)])
+        raise SystemExit(_run_data_module("state_manager", backfill_args))
     if tool == "rag":
         raise SystemExit(_run_data_module("rag_adapter", [*forward_args, *rest]))
     if tool == "style":

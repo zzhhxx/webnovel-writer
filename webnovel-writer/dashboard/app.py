@@ -169,9 +169,9 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
         limit: int = 200,
     ):
         with closing(_get_db()) as conn:
-            q = "SELECT * FROM relationship_events"
-            params: list = []
             clauses: list[str] = []
+            params: list = []
+            q = "SELECT * FROM relationship_events"
             if entity:
                 clauses.append("(from_entity = ? OR to_entity = ?)")
                 params.extend([entity, entity])
@@ -185,8 +185,7 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
                 q += " WHERE " + " AND ".join(clauses)
             q += " ORDER BY chapter DESC, id DESC LIMIT ?"
             params.append(limit)
-            rows = conn.execute(q, params).fetchall()
-            return [dict(r) for r in rows]
+            return _fetchall_safe(conn, q, tuple(params))
 
     @app.get("/api/chapters")
     def list_chapters():
