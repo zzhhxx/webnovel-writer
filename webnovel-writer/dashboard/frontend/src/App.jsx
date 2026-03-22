@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { fetchJSON, subscribeSSE } from './api.js'
 import ForceGraph3D from 'react-force-graph-3d'
 
@@ -11,6 +11,8 @@ export default function App() {
     const [projectInfo, setProjectInfo] = useState(null)
     const [refreshKey, setRefreshKey] = useState(0)
     const [connected, setConnected] = useState(false)
+    const refreshTimerRef = useRef(null)
+    const lastRefreshAtRef = useRef(0)
 
     const loadProjectInfo = useCallback(() => {
         fetchJSON('/api/project/info')
@@ -20,19 +22,49 @@ export default function App() {
 
     useEffect(() => { loadProjectInfo() }, [loadProjectInfo, refreshKey])
 
+    const scheduleRefresh = useCallback(() => {
+        const now = Date.now()
+        const minIntervalMs = 800
+        const elapsed = now - lastRefreshAtRef.current
+
+        if (elapsed >= minIntervalMs) {
+            lastRefreshAtRef.current = now
+            setRefreshKey(k => k + 1)
+            return
+        }
+
+        if (refreshTimerRef.current) return
+
+        const waitMs = Math.max(0, minIntervalMs - elapsed)
+        refreshTimerRef.current = setTimeout(() => {
+            refreshTimerRef.current = null
+            lastRefreshAtRef.current = Date.now()
+            setRefreshKey(k => k + 1)
+        }, waitMs)
+    }, [])
+
     // SSE 订阅
     useEffect(() => {
         const unsub = subscribeSSE(
-            () => {
-                setRefreshKey(k => k + 1)
+            (evt) => {
+                // index.db-shm 在只读查询时也可能抖动，忽略它可避免无意义刷新。
+                if (evt?.file === 'index.db-shm') return
+                scheduleRefresh()
             },
             {
                 onOpen: () => setConnected(true),
                 onError: () => setConnected(false),
             },
         )
-        return () => { unsub(); setConnected(false) }
-    }, [])
+        return () => {
+            unsub()
+            setConnected(false)
+            if (refreshTimerRef.current) {
+                clearTimeout(refreshTimerRef.current)
+                refreshTimerRef.current = null
+            }
+        }
+    }, [scheduleRefresh])
 
     const title = projectInfo?.project_info?.title || '未加载'
 

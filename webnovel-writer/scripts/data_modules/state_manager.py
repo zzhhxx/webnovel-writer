@@ -670,12 +670,15 @@ class StateManager:
                     if entity_type and entity_id:
                         self._sql_state_manager.register_alias(alias, entity_id, entity_type)
 
-            # 同步状态变化
+            # 同步状态变化（含批次内去重，避免重试队列合并后重复写入）
+            seen_state_change_keys = set(processed_state_changes)
             for change in self._pending_state_changes:
                 if not isinstance(change, dict):
                     continue
-                if self._normalize_state_change_key(change) in processed_state_changes:
+                state_change_key = self._normalize_state_change_key(change)
+                if state_change_key in seen_state_change_keys:
                     continue
+                seen_state_change_keys.add(state_change_key)
                 self._sql_state_manager.record_state_change(
                     entity_id=change.get("entity_id", ""),
                     field=change.get("field", ""),
@@ -685,12 +688,15 @@ class StateManager:
                     chapter=change.get("chapter", 0)
                 )
 
-            # 同步关系
+            # 同步关系（含批次内去重，避免 relationship_events 重复写入）
+            seen_relationship_keys = set(processed_relationships)
             for rel in self._pending_structured_relationships:
                 if not isinstance(rel, dict):
                     continue
-                if self._normalize_relationship_key(rel) in processed_relationships:
+                relationship_key = self._normalize_relationship_key(rel)
+                if relationship_key in seen_relationship_keys:
                     continue
+                seen_relationship_keys.add(relationship_key)
                 self._sql_state_manager.upsert_relationship(
                     from_entity=rel.get("from_entity", ""),
                     to_entity=rel.get("to_entity", ""),

@@ -229,6 +229,49 @@ def test_process_chapter_result_and_sqlite_sync(temp_project):
     assert "xiaoyan" in by_tier
 
 
+def test_sync_pending_patches_dedupes_state_changes_and_relationship_events(temp_project):
+    manager = StateManager(temp_project)
+    manager.add_entity(EntityState(id="xiaoyan", name="萧炎", type="角色", tier="核心"))
+    manager.add_entity(EntityState(id="yaolao", name="药老", type="角色", tier="重要"))
+
+    change = {
+        "entity_id": "xiaoyan",
+        "field": "realm",
+        "old": "斗者",
+        "new": "斗师",
+        "reason": "突破",
+        "chapter": 8,
+    }
+    rel = {
+        "from_entity": "xiaoyan",
+        "to_entity": "yaolao",
+        "type": "师徒",
+        "description": "收徒",
+        "chapter": 8,
+    }
+
+    manager._pending_state_changes.extend([dict(change), dict(change)])
+    manager._pending_structured_relationships.extend([dict(rel), dict(rel)])
+    manager.save_state()
+
+    idx = IndexManager(temp_project)
+    changes = [
+        item
+        for item in idx.get_entity_state_changes("xiaoyan", limit=20)
+        if int(item.get("chapter") or 0) == 8 and str(item.get("field") or "") == "realm"
+    ]
+    assert len(changes) == 1
+
+    events = [
+        item
+        for item in idx.get_relationship_events("xiaoyan", direction="both", from_chapter=8, to_chapter=8, limit=20)
+        if str(item.get("from_entity") or "") == "xiaoyan"
+        and str(item.get("to_entity") or "") == "yaolao"
+        and str(item.get("type") or "") == "师徒"
+    ]
+    assert len(events) == 1
+
+
 def test_export_context_and_protagonist_alias(temp_project):
     manager = StateManager(temp_project, enable_sqlite_sync=False)
     manager.add_entity(EntityState(id="xiaoyan", name="萧炎", type="角色", tier="核心"))

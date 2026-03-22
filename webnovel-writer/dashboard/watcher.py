@@ -42,9 +42,12 @@ class _WebnovelFileHandler(FileSystemEventHandler):
         name = file_path.name.lower()
         if name in self.WATCH_NAMES:
             return True
-        # SQLite WAL 模式写入通常落在 index.db-wal / index.db-shm。
-        # 只监听 index.db 会导致数据库更新后前端不刷新。
-        if name == self.INDEX_DB_PREFIX or name.startswith(f"{self.INDEX_DB_PREFIX}-"):
+        # SQLite WAL 模式写入通常落在 index.db-wal。
+        # 注意：index.db-shm 在只读查询时也可能频繁抖动，容易触发前端“刷新风暴”。
+        # 因此显式忽略 index.db-shm，仅监听 index.db 与 index.db-wal。
+        if name == f"{self.INDEX_DB_PREFIX}-shm":
+            return False
+        if name == self.INDEX_DB_PREFIX or name == f"{self.INDEX_DB_PREFIX}-wal":
             return True
 
         resolved = file_path.resolve()
@@ -87,6 +90,10 @@ class FileWatcher:
         self._observer: Observer | None = None
         self._subscribers: list[asyncio.Queue] = []
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._last_dispatch_ts: float = 0.0
+        self._dispatch_min_interval_sec: float = 0.8
+        self._pending_msg: str | None = None
+        self._pending_handle: asyncio.Handle | None = None
 
     # --- 订阅管理 ---
 
@@ -110,6 +117,29 @@ class FileWatcher:
             self._loop.call_soon_threadsafe(self._dispatch, msg)
 
     def _dispatch(self, msg: str):
+        now = time.time()
+        elapsed = now - self._last_dispatch_ts
+        if elapsed < self._dispatch_min_interval_sec:
+            # 高频文件变更时合并消息，仅推送窗口内最后一条，避免前端连续重绘。
+            self._pending_msg = msg
+            if self._pending_handle is None and self._loop and not self._loop.is_closed():
+                wait_sec = max(0.0, self._dispatch_min_interval_sec - elapsed)
+                self._pending_handle = self._loop.call_later(wait_sec, self._flush_pending)
+            return
+
+        self._broadcast(msg)
+        self._last_dispatch_ts = now
+
+    def _flush_pending(self):
+        self._pending_handle = None
+        msg = self._pending_msg
+        self._pending_msg = None
+        if not msg:
+            return
+        self._broadcast(msg)
+        self._last_dispatch_ts = time.time()
+
+    def _broadcast(self, msg: str):
         for q in list(self._subscribers):
             try:
                 q.put_nowait(msg)
@@ -167,3 +197,8 @@ class FileWatcher:
             self._observer.stop()
             self._observer.join(timeout=3)
             self._observer = None
+        if self._pending_handle is not None:
+            self._pending_handle.cancel()
+            self._pending_handle = None
+        self._pending_msg = None
+        self._last_dispatch_ts = 0.0
