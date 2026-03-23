@@ -767,6 +767,110 @@ def test_state_manager_cli_backfill_invalid_range(temp_project, monkeypatch, cap
     assert out.get("error", {}).get("code") == "INVALID_RANGE"
 
 
+def test_state_manager_cli_backfill_extended_domains_from_legacy_state(temp_project, monkeypatch, capsys):
+    legacy_state = {
+        "progress": {"current_chapter": 2, "total_words": 3000},
+        "chapter_meta": {
+            "0002": {"characters": ["萧炎", "药老"], "title": "回填测试章"},
+        },
+        "entities_v3": {
+            "角色": {
+                "xiaoyan": {
+                    "canonical_name": "萧炎",
+                    "tier": "核心",
+                    "current": {"realm": "斗师"},
+                    "first_appearance": 1,
+                    "last_appearance": 2,
+                    "aliases": ["炎帝"],
+                },
+                "yaolao": {
+                    "canonical_name": "药老",
+                    "tier": "重要",
+                    "current": {},
+                    "first_appearance": 2,
+                    "last_appearance": 2,
+                },
+            }
+        },
+        "alias_index": {
+            "炎帝": [{"id": "xiaoyan", "type": "角色"}],
+        },
+        "state_changes": [
+            {
+                "entity_id": "xiaoyan",
+                "field": "realm",
+                "old": "斗者",
+                "new": "斗师",
+                "reason": "突破",
+                "chapter": 2,
+            }
+        ],
+        "structured_relationships": [
+            {
+                "from": "xiaoyan",
+                "to": "yaolao",
+                "type": "师徒",
+                "description": "拜师",
+                "chapter": 2,
+            }
+        ],
+    }
+    temp_project.state_file.write_text(json.dumps(legacy_state, ensure_ascii=False), encoding="utf-8")
+
+    idx = IndexManager(temp_project)
+    assert idx.get_entity("xiaoyan") is None
+
+    def run_cli(args):
+        monkeypatch.setattr(sys, "argv", args)
+        from data_modules import state_manager as sm
+
+        sm.main()
+        out = capsys.readouterr().out
+        return json.loads(out)
+
+    dry_run = run_cli(
+        [
+            "state_manager",
+            "--project-root",
+            str(temp_project.project_root),
+            "backfill-missing",
+            "--only",
+            "entities,aliases,state_changes,relationships,appearances",
+            "--dry-run",
+        ]
+    )
+    assert dry_run["status"] == "success"
+    domains = dry_run.get("data", {}).get("domains", {})
+    assert domains.get("entities", {}).get("missing", 0) >= 2
+    assert domains.get("aliases", {}).get("missing", 0) >= 1
+    assert domains.get("state_changes", {}).get("missing", 0) >= 1
+    assert domains.get("relationships", {}).get("missing", 0) >= 1
+    assert domains.get("appearances", {}).get("missing", 0) >= 1
+
+    applied = run_cli(
+        [
+            "state_manager",
+            "--project-root",
+            str(temp_project.project_root),
+            "backfill-missing",
+            "--only",
+            "entities,aliases,state_changes,relationships,appearances",
+        ]
+    )
+    assert applied["status"] == "success"
+    applied_domains = applied.get("data", {}).get("domains", {})
+    assert applied_domains.get("entities", {}).get("repaired", 0) >= 2
+    assert applied_domains.get("relationships", {}).get("repaired", 0) >= 1
+    assert idx.get_entity("xiaoyan") is not None
+    assert idx.get_entity("yaolao") is not None
+    assert "炎帝" in idx.get_entity_aliases("xiaoyan")
+    changes = idx.get_entity_state_changes("xiaoyan")
+    assert any(str(item.get("field")) == "realm" for item in changes)
+    assert idx.get_relationship_between("xiaoyan", "yaolao")
+    appearances = idx.get_chapter_appearances(2)
+    assert any(str(item.get("entity_id")) == "xiaoyan" for item in appearances)
+
+
 def test_save_state_timeout(monkeypatch, temp_project):
     import filelock
     from data_modules import state_manager as sm

@@ -212,7 +212,7 @@ def main() -> None:
     p_state = sub.add_parser("state", help="转发到 state_manager")
     p_state.add_argument("args", nargs=argparse.REMAINDER)
 
-    p_backfill = sub.add_parser("backfill-missing", help="补齐缺失章节索引（转发到 state_manager backfill-missing）")
+    p_backfill = sub.add_parser("backfill-missing", help="补齐缺失结构化数据（转发到 state_manager backfill-missing）")
     p_backfill.add_argument("--from-chapter", type=int, help="起始章节（含）")
     p_backfill.add_argument("--to-chapter", type=int, help="结束章节（含）")
     p_backfill.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
@@ -227,6 +227,16 @@ def main() -> None:
         dest="include_reading_power",
         action="store_false",
         help="仅补 chapters，不处理 chapter_reading_power",
+    )
+    p_backfill.add_argument(
+        "--only",
+        action="append",
+        help="仅回填指定数据域（可重复/逗号分隔）",
+    )
+    p_backfill.add_argument(
+        "--skip",
+        action="append",
+        help="跳过指定数据域（可重复/逗号分隔）",
     )
     p_backfill.set_defaults(include_reading_power=True)
 
@@ -311,6 +321,10 @@ def main() -> None:
             backfill_args.extend(["--to-chapter", str(args.to_chapter)])
         if not bool(args.include_reading_power):
             backfill_args.append("--no-reading-power")
+        for value in list(args.only or []):
+            backfill_args.extend(["--only", str(value)])
+        for value in list(args.skip or []):
+            backfill_args.extend(["--skip", str(value)])
         raise SystemExit(_run_data_module("state_manager", backfill_args))
     if tool == "rag":
         raise SystemExit(_run_data_module("rag_adapter", [*forward_args, *rest]))

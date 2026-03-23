@@ -1,6 +1,7 @@
-import { memo, useState, useEffect, useCallback, useRef } from 'react'
+import { memo, useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react'
 import { fetchJSON, subscribeSSE } from './api.js'
-import ForceGraph3D from 'react-force-graph-3d'
+
+const GraphPage = lazy(() => import('./pages/GraphPage.jsx'))
 
 // ====================================================================
 // 主应用
@@ -9,48 +10,171 @@ import ForceGraph3D from 'react-force-graph-3d'
 export default function App() {
     const [page, setPage] = useState('dashboard')
     const [projectInfo, setProjectInfo] = useState(null)
-    const [refreshKey, setRefreshKey] = useState(0)
+    const [stateRefreshKey, setStateRefreshKey] = useState(0)
+    const [dbRefreshKey, setDbRefreshKey] = useState(0)
+    const [fileRefreshKey, setFileRefreshKey] = useState(0)
     const [connected, setConnected] = useState(false)
-    const refreshTimerRef = useRef(null)
-    const lastRefreshAtRef = useRef(0)
+    const [isPageVisible, setIsPageVisible] = useState(
+        () => typeof document === 'undefined' || document.visibilityState === 'visible',
+    )
+    const refreshTimerRef = useRef({ state: null, db: null, files: null })
+    const lastRefreshAtRef = useRef({ state: 0, db: 0, files: 0 })
+    const dbRevisionRef = useRef('')
+    const pendingRefreshRef = useRef({ state: false, db: false, files: false })
+    const projectInfoSignatureRef = useRef('')
+    const traceSeqRef = useRef(0)
+    const [debugEnabled, setDebugEnabled] = useState(() => loadRefreshDebugEnabled())
+    const [debugPanelOpen, setDebugPanelOpen] = useState(false)
+    const [refreshDebug, setRefreshDebug] = useState(() => createRefreshDebugState())
+    const [refreshTrace, setRefreshTrace] = useState([])
 
-    const loadProjectInfo = useCallback(() => {
-        fetchJSON('/api/project/info')
-            .then(setProjectInfo)
-            .catch(() => setProjectInfo(null))
-    }, [])
+    const recordRefreshEvent = useCallback((scope, phase, source) => {
+        if (!debugEnabled) return
+        const target = scope === 'db' || scope === 'files' ? scope : 'state'
+        const ts = Date.now()
+        setRefreshDebug((prev) => {
+            const oldScope = prev[target] || { queued: 0, fired: 0, lastAt: 0, lastSource: '-' }
+            const nextScope = { ...oldScope }
+            if (phase === 'queued') nextScope.queued += 1
+            if (phase === 'fired') nextScope.fired += 1
+            nextScope.lastAt = ts
+            nextScope.lastSource = source || phase
+            return { ...prev, [target]: nextScope }
+        })
+        const id = traceSeqRef.current + 1
+        traceSeqRef.current = id
+        setRefreshTrace((prev) => [
+            { id, ts, scope: target, phase, source: source || '-' },
+            ...prev,
+        ].slice(0, 40))
+    }, [debugEnabled])
 
-    useEffect(() => { loadProjectInfo() }, [loadProjectInfo, refreshKey])
+    useEffect(() => {
+        saveRefreshDebugEnabled(debugEnabled)
+        if (debugEnabled) return
+        setDebugPanelOpen(false)
+        setRefreshDebug(createRefreshDebugState())
+        setRefreshTrace([])
+        traceSeqRef.current = 0
+    }, [debugEnabled])
 
-    const scheduleRefresh = useCallback(() => {
+    useEffect(() => {
+        const controller = new AbortController()
+        fetchJSON('/api/project/info', {}, { signal: controller.signal })
+            .then((data) => {
+                const nextSig = createSimpleSignature(data)
+                if (projectInfoSignatureRef.current === nextSig) return
+                projectInfoSignatureRef.current = nextSig
+                setProjectInfo(data)
+            })
+            .catch((err) => {
+                if (isAbortError(err)) return
+                setProjectInfo(null)
+            })
+        return () => controller.abort()
+    }, [stateRefreshKey])
+
+    const scheduleRefresh = useCallback((scope, source = 'unknown') => {
+        const target = scope === 'db' || scope === 'files' ? scope : 'state'
         const now = Date.now()
         const minIntervalMs = 1500
-        const elapsed = now - lastRefreshAtRef.current
+        const elapsed = now - (lastRefreshAtRef.current[target] || 0)
+
+        const bump = () => {
+            lastRefreshAtRef.current[target] = Date.now()
+            recordRefreshEvent(target, 'fired', source)
+            if (target === 'db') {
+                setDbRefreshKey(k => k + 1)
+                return
+            }
+            if (target === 'files') {
+                setFileRefreshKey(k => k + 1)
+                return
+            }
+            setStateRefreshKey(k => k + 1)
+        }
 
         if (elapsed >= minIntervalMs) {
-            lastRefreshAtRef.current = now
-            setRefreshKey(k => k + 1)
+            bump()
             return
         }
 
-        if (refreshTimerRef.current) return
+        if (refreshTimerRef.current[target]) return
 
         const waitMs = Math.max(0, minIntervalMs - elapsed)
-        refreshTimerRef.current = setTimeout(() => {
-            refreshTimerRef.current = null
-            lastRefreshAtRef.current = Date.now()
-            setRefreshKey(k => k + 1)
+        recordRefreshEvent(target, 'queued', `${source}|throttle`)
+        refreshTimerRef.current[target] = setTimeout(() => {
+            refreshTimerRef.current[target] = null
+            bump()
         }, waitMs)
-    }, [])
+    }, [recordRefreshEvent])
+
+    const requestRefresh = useCallback((scope, source = 'unknown') => {
+        const target = scope === 'db' || scope === 'files' ? scope : 'state'
+        if (target === 'db' && !isDbRefreshActivePage(page)) {
+            pendingRefreshRef.current.db = true
+            recordRefreshEvent(target, 'queued', `${source}|inactive-page`)
+            return
+        }
+        if (target === 'files' && page !== 'files') {
+            pendingRefreshRef.current.files = true
+            recordRefreshEvent(target, 'queued', `${source}|inactive-page`)
+            return
+        }
+        if (!isPageVisible) {
+            pendingRefreshRef.current[target] = true
+            recordRefreshEvent(target, 'queued', `${source}|hidden`)
+            return
+        }
+        scheduleRefresh(target, source)
+    }, [isPageVisible, page, recordRefreshEvent, scheduleRefresh])
+
+    useEffect(() => {
+        if (typeof document === 'undefined') return () => { }
+
+        const onVisibilityChange = () => {
+            const visible = document.visibilityState === 'visible'
+            setIsPageVisible(visible)
+            if (!visible) return
+            for (const scope of ['state', 'db', 'files']) {
+                if (scope === 'db' && !isDbRefreshActivePage(page)) continue
+                if (scope === 'files' && page !== 'files') continue
+                if (!pendingRefreshRef.current[scope]) continue
+                pendingRefreshRef.current[scope] = false
+                scheduleRefresh(scope, 'visibility-resume')
+            }
+        }
+
+        document.addEventListener('visibilitychange', onVisibilityChange)
+        return () => document.removeEventListener('visibilitychange', onVisibilityChange)
+    }, [page, scheduleRefresh])
+
+    useEffect(() => {
+        if (!isPageVisible) return
+        const scopeChecks = [
+            ['state', true],
+            ['db', isDbRefreshActivePage(page)],
+            ['files', page === 'files'],
+        ]
+        for (const [scope, enabled] of scopeChecks) {
+            if (!enabled) continue
+            if (!pendingRefreshRef.current[scope]) continue
+            pendingRefreshRef.current[scope] = false
+            scheduleRefresh(scope, 'page-activate')
+        }
+    }, [isPageVisible, page, scheduleRefresh])
 
     // SSE 订阅
     useEffect(() => {
-        const refreshableFiles = new Set(['state.json', 'workflow_state.json'])
+        const refreshableStateFiles = new Set(['state.json', 'workflow_state.json'])
         const unsub = subscribeSSE(
             (evt) => {
                 const file = String(evt?.file || '').toLowerCase()
-                if (!refreshableFiles.has(file)) return
-                scheduleRefresh()
+                if (refreshableStateFiles.has(file)) {
+                    requestRefresh('state', `sse:${file}`)
+                    return
+                }
+                requestRefresh('files', `sse:${file || 'unknown'}`)
             },
             {
                 onOpen: () => setConnected(true),
@@ -60,14 +184,67 @@ export default function App() {
         return () => {
             unsub()
             setConnected(false)
-            if (refreshTimerRef.current) {
-                clearTimeout(refreshTimerRef.current)
-                refreshTimerRef.current = null
-            }
+            Object.values(refreshTimerRef.current).forEach((timerId) => {
+                if (timerId) clearTimeout(timerId)
+            })
+            refreshTimerRef.current = { state: null, db: null, files: null }
         }
-    }, [scheduleRefresh])
+    }, [requestRefresh])
+
+    // 数据库变化轮询：
+    // watcher 为避免自触发回路忽略了 index.db*，这里低频轮询 revision 用于感知“仅数据库更新”的场景。
+    useEffect(() => {
+        if (!isPageVisible || !isDbRefreshActivePage(page)) {
+            return () => { }
+        }
+
+        let disposed = false
+        let activeController = null
+        let isChecking = false
+
+        const checkDbRevision = () => {
+            if (isChecking) return
+            isChecking = true
+            const controller = new AbortController()
+            activeController = controller
+            fetchJSON('/api/db/revision', {}, { signal: controller.signal })
+                .then((data) => {
+                    if (disposed) return
+                    const nextRevision = String(data?.revision || '')
+                    const prevRevision = dbRevisionRef.current
+                    if (!prevRevision) {
+                        dbRevisionRef.current = nextRevision
+                        return
+                    }
+                    if (prevRevision !== nextRevision) {
+                        dbRevisionRef.current = nextRevision
+                        requestRefresh('db', 'db-revision-poll')
+                        return
+                    }
+                    dbRevisionRef.current = nextRevision
+                })
+                .catch((err) => {
+                    if (!isAbortError(err)) {
+                        // ignore non-critical polling errors
+                    }
+                })
+                .finally(() => {
+                    isChecking = false
+                    if (activeController === controller) activeController = null
+                })
+        }
+
+        checkDbRevision()
+        const timer = setInterval(checkDbRevision, 5000)
+        return () => {
+            disposed = true
+            clearInterval(timer)
+            if (activeController) activeController.abort()
+        }
+    }, [isPageVisible, page, requestRefresh])
 
     const title = projectInfo?.project_info?.title || '未加载'
+    const pendingSnapshot = pendingRefreshRef.current
 
     return (
         <div className="app-layout">
@@ -92,15 +269,44 @@ export default function App() {
                     <span className={`live-dot ${connected ? '' : 'disconnected'}`} />
                     {connected ? '实时同步中' : '未连接'}
                 </div>
+                <div style={{ marginTop: 8 }}>
+                    <button
+                        className={`filter-btn ${debugEnabled ? 'active' : ''}`}
+                        type="button"
+                        onClick={() => setDebugEnabled(v => !v)}
+                    >
+                        {debugEnabled ? '关闭调试' : '开启调试'}
+                    </button>
+                </div>
+                {debugEnabled ? (
+                    <RefreshDebugPanel
+                        open={debugPanelOpen}
+                        onToggle={() => setDebugPanelOpen(v => !v)}
+                        page={page}
+                        isPageVisible={isPageVisible}
+                        stats={refreshDebug}
+                        trace={refreshTrace}
+                        pending={pendingSnapshot}
+                    />
+                ) : null}
             </aside>
 
             <main className="main-content">
-                {page === 'dashboard' && <DashboardPage data={projectInfo} />}
-                {page === 'entities' && <EntitiesPage refreshSignal={refreshKey} />}
-                {page === 'graph' && <GraphPage />}
-                {page === 'chapters' && <ChaptersPage refreshSignal={refreshKey} />}
-                {page === 'files' && <FilesPage refreshSignal={refreshKey} />}
-                {page === 'reading' && <ReadingPowerPage refreshSignal={refreshKey} />}
+                {page === 'dashboard' && (
+                    <DashboardPage
+                        data={projectInfo}
+                        dbRefreshSignal={dbRefreshKey}
+                    />
+                )}
+                {page === 'entities' && <EntitiesPage refreshSignal={dbRefreshKey} />}
+                {page === 'graph' && (
+                    <Suspense fallback={<div className="loading">图谱页面加载中…</div>}>
+                        <GraphPage refreshSignal={dbRefreshKey} />
+                    </Suspense>
+                )}
+                {page === 'chapters' && <ChaptersPage refreshSignal={dbRefreshKey} />}
+                {page === 'files' && <FilesPage refreshSignal={fileRefreshKey} stateRefreshSignal={stateRefreshKey} />}
+                {page === 'reading' && <ReadingPowerPage refreshSignal={dbRefreshKey} />}
             </main>
         </div>
     )
@@ -142,14 +348,31 @@ const FULL_DATA_DOMAINS = [
     { id: 'ops', label: 'RAG 与工具' },
 ]
 
-const PARTICLE_SPEED = () => 0.006
+const FULL_DATA_REQUESTS = {
+    entities: { path: '/api/entities' },
+    chapters: { path: '/api/chapters' },
+    scenes: { path: '/api/scenes', params: { limit: 200 } },
+    aliases: { path: '/api/aliases' },
+    stateChanges: { path: '/api/state-changes', params: { limit: 120 } },
+    relationships: { path: '/api/relationships', params: { limit: 300 } },
+    relationshipEvents: { path: '/api/relationship-events', params: { limit: 200 } },
+    readingPower: { path: '/api/reading-power', params: { limit: 100 } },
+    overrides: { path: '/api/overrides', params: { limit: 120 } },
+    debts: { path: '/api/debts', params: { limit: 120 } },
+    debtEvents: { path: '/api/debt-events', params: { limit: 150 } },
+    reviewMetrics: { path: '/api/review-metrics', params: { limit: 50 } },
+    invalidFacts: { path: '/api/invalid-facts', params: { limit: 120 } },
+    checklistScores: { path: '/api/checklist-scores', params: { limit: 120 } },
+    ragQueries: { path: '/api/rag-queries', params: { limit: 150 } },
+    toolStats: { path: '/api/tool-stats', params: { limit: 200 } },
+}
 
 
 // ====================================================================
 // 页面 1：数据总览
 // ====================================================================
 
-function DashboardPage({ data }) {
+function DashboardPage({ data, dbRefreshSignal }) {
     if (!data) return <div className="loading">加载中…</div>
 
     const info = data.project_info || {}
@@ -260,7 +483,7 @@ function DashboardPage({ data }) {
                 </div>
             ) : null}
 
-            <MergedDataView />
+            <MergedDataView refreshSignal={dbRefreshSignal} />
         </>
     )
 }
@@ -275,19 +498,45 @@ function EntitiesPage({ refreshSignal }) {
     const [typeFilter, setTypeFilter] = useState('')
     const [selected, setSelected] = useState(null)
     const [changes, setChanges] = useState([])
+    const [loadError, setLoadError] = useState('')
+    const [reloadKey, setReloadKey] = useState(0)
 
     useEffect(() => {
-        fetchJSON('/api/entities').then(setEntities).catch(() => { })
-    }, [refreshSignal])
+        const controller = new AbortController()
+        setLoadError('')
+        fetchJSON('/api/entities', {}, { signal: controller.signal })
+            .then((rows) => setEntities(Array.isArray(rows) ? rows : []))
+            .catch((err) => {
+                if (isAbortError(err)) return
+                setEntities([])
+                setLoadError('实体列表加载失败，请重试')
+            })
+        return () => controller.abort()
+    }, [refreshSignal, reloadKey])
 
     useEffect(() => {
-        if (selected) {
-            fetchJSON('/api/state-changes', { entity: selected.id, limit: 30 }).then(setChanges).catch(() => setChanges([]))
+        if (!selected) {
+            setChanges([])
+            return
         }
+        const controller = new AbortController()
+        fetchJSON('/api/state-changes', { entity: selected.id, limit: 30 }, { signal: controller.signal })
+            .then((rows) => setChanges(Array.isArray(rows) ? rows : []))
+            .catch((err) => {
+                if (isAbortError(err)) return
+                setChanges([])
+            })
+        return () => controller.abort()
     }, [selected, refreshSignal])
 
     const types = [...new Set(entities.map(e => e.type))].sort()
     const filteredEntities = typeFilter ? entities.filter(e => e.type === typeFilter) : entities
+    const entityVirtual = useVirtualRows(filteredEntities.length, {
+        enabled: filteredEntities.length > 160,
+        rowHeight: 44,
+        maxHeight: 560,
+    })
+    const visibleEntities = filteredEntities.slice(entityVirtual.start, entityVirtual.end)
 
     return (
         <>
@@ -303,14 +552,29 @@ function EntitiesPage({ refreshSignal }) {
                 ))}
             </div>
 
+            <ErrorNotice
+                message={loadError}
+                onRetry={() => setReloadKey(v => v + 1)}
+            />
+
             <div className="split-layout">
                 <div className="split-main">
                     <div className="card">
-                        <div className="table-wrap">
+                        <div
+                            className="table-wrap"
+                            ref={entityVirtual.containerRef}
+                            onScroll={entityVirtual.onScroll}
+                            style={entityVirtual.tableWrapStyle}
+                        >
                             <table className="data-table">
                                 <thead><tr><th>名称</th><th>类型</th><th>层级</th><th>首现</th><th>末现</th></tr></thead>
                                 <tbody>
-                                    {filteredEntities.map(e => (
+                                    {entityVirtual.topPad > 0 ? (
+                                        <tr aria-hidden>
+                                            <td colSpan={5} style={{ height: entityVirtual.topPad, padding: 0, border: 'none' }} />
+                                        </tr>
+                                    ) : null}
+                                    {visibleEntities.map(e => (
                                         <tr
                                             key={e.id}
                                             role="button"
@@ -328,6 +592,11 @@ function EntitiesPage({ refreshSignal }) {
                                             <td>{e.last_appearance || '—'}</td>
                                         </tr>
                                     ))}
+                                    {entityVirtual.bottomPad > 0 ? (
+                                        <tr aria-hidden>
+                                            <td colSpan={5} style={{ height: entityVirtual.bottomPad, padding: 0, border: 'none' }} />
+                                        </tr>
+                                    ) : null}
                                 </tbody>
                             </table>
                         </div>
@@ -381,148 +650,35 @@ function EntitiesPage({ refreshSignal }) {
     )
 }
 
-
-// ====================================================================
-// 页面 3：3D 宇宙关系图谱
-// ====================================================================
-
-const GraphPage = memo(function GraphPage() {
-    const [relationships, setRelationships] = useState([])
-    const [graphData, setGraphData] = useState({ nodes: [], links: [] })
-
-    useEffect(() => {
-        Promise.all([
-            fetchJSON('/api/relationships', { limit: 1000 }),
-            fetchJSON('/api/relationship-events', { limit: 2000 }),
-            fetchJSON('/api/entities'),
-        ]).then(([rels, relEvents, ents]) => {
-            const effectiveRels = buildEffectiveRelationships(rels, relEvents)
-            setRelationships(effectiveRels)
-            const typeColors = {
-                '角色': '#4f8ff7', '地点': '#34d399', '星球': '#22d3ee', '神仙': '#f59e0b',
-                '势力': '#8b5cf6', '招式': '#ef4444', '法宝': '#ec4899'
-            }
-            const relatedIds = new Set()
-            effectiveRels.forEach(r => { relatedIds.add(r.from_entity); relatedIds.add(r.to_entity) })
-            const entityMap = {}
-            ents.forEach(e => { entityMap[e.id] = e })
-            const tierWeights = {
-                '核心': 8,
-                '重要': 5,
-                '次要': 3,
-                '支线': 3,
-                '装饰': 2,
-                'S': 8,
-                'A': 5,
-                'B': 3,
-            }
-
-            const nodes = [...relatedIds].map(id => ({
-                id,
-                name: entityMap[id]?.canonical_name || id,
-                val: tierWeights[entityMap[id]?.tier] || 2,
-                color: typeColors[entityMap[id]?.type] || '#5c6078'
-            }))
-            const links = effectiveRels.map(r => ({
-                source: r.from_entity,
-                target: r.to_entity,
-                name: r.type
-            }))
-            setGraphData({ nodes, links })
-        }).catch(() => { })
-    }, [])
-
-    return (
-        <>
-            <div className="page-header">
-                <h2>🕸️ 关系图谱</h2>
-                <span className="card-badge badge-blue">{relationships.length} 条引力链接</span>
-            </div>
-            <div className="card graph-shell">
-                <ForceGraph3D
-                    graphData={graphData}
-                    nodeLabel="name"
-                    nodeColor="color"
-                    nodeRelSize={6}
-                    linkColor={() => 'rgba(127, 90, 240, 0.35)'}
-                    linkWidth={1}
-                    linkDirectionalParticles={2}
-                    linkDirectionalParticleWidth={1.5}
-                    linkDirectionalParticleSpeed={PARTICLE_SPEED}
-                    backgroundColor="#fffaf0"
-                    showNavInfo={false}
-                />
-            </div>
-        </>
-    )
-})
-
-function buildEffectiveRelationships(relationships, events) {
-    const index = new Map()
-    const rows = Array.isArray(relationships) ? relationships : []
-    const eventRows = Array.isArray(events) ? events : []
-
-    rows.forEach(row => {
-        const from = row?.from_entity
-        const to = row?.to_entity
-        const type = row?.type
-        if (!from || !to || !type) return
-        const key = `${from}::${to}::${type}`
-        index.set(key, {
-            from_entity: from,
-            to_entity: to,
-            type,
-            chapter: Number(row?.chapter) || 0,
-            description: row?.description || '',
-        })
-    })
-
-    eventRows
-        .slice()
-        .sort((a, b) => {
-            const chapterDiff = (Number(a?.chapter) || 0) - (Number(b?.chapter) || 0)
-            if (chapterDiff !== 0) return chapterDiff
-            return (Number(a?.id) || 0) - (Number(b?.id) || 0)
-        })
-        .forEach(row => {
-            const from = row?.from_entity
-            const to = row?.to_entity
-            const type = row?.type
-            if (!from || !to || !type) return
-
-            const key = `${from}::${to}::${type}`
-            const action = String(row?.action || 'update').toLowerCase()
-            if (action === 'remove') {
-                index.delete(key)
-                return
-            }
-
-            index.set(key, {
-                from_entity: from,
-                to_entity: to,
-                type,
-                chapter: Number(row?.chapter) || 0,
-                description: row?.description || '',
-            })
-        })
-
-    return [...index.values()].sort((a, b) => (Number(b?.chapter) || 0) - (Number(a?.chapter) || 0))
-}
-
-
-
 // ====================================================================
 // 页面 4：章节一览
 // ====================================================================
 
 function ChaptersPage({ refreshSignal }) {
     const [chapters, setChapters] = useState([])
+    const [loadError, setLoadError] = useState('')
+    const [reloadKey, setReloadKey] = useState(0)
 
     useEffect(() => {
-        fetchJSON('/api/chapters').then(setChapters).catch(() => { })
-    }, [refreshSignal])
+        const controller = new AbortController()
+        setLoadError('')
+        fetchJSON('/api/chapters', {}, { signal: controller.signal })
+            .then((rows) => setChapters(Array.isArray(rows) ? rows : []))
+            .catch((err) => {
+                if (isAbortError(err)) return
+                setChapters([])
+                setLoadError('章节数据加载失败，请重试')
+            })
+        return () => controller.abort()
+    }, [refreshSignal, reloadKey])
 
     const totalWords = chapters.reduce((s, c) => s + (c.word_count || 0), 0)
+    const chapterVirtual = useVirtualRows(chapters.length, {
+        enabled: chapters.length > 180,
+        rowHeight: 44,
+        maxHeight: 560,
+    })
+    const visibleChapters = chapters.slice(chapterVirtual.start, chapterVirtual.end)
 
     return (
         <>
@@ -530,12 +686,23 @@ function ChaptersPage({ refreshSignal }) {
                 <h2>📝 章节一览</h2>
                 <span className="card-badge badge-green">{chapters.length} 章 · {formatNumber(totalWords)} 字</span>
             </div>
+            <ErrorNotice message={loadError} onRetry={() => setReloadKey(v => v + 1)} />
             <div className="card">
-                <div className="table-wrap">
+                <div
+                    className="table-wrap"
+                    ref={chapterVirtual.containerRef}
+                    onScroll={chapterVirtual.onScroll}
+                    style={chapterVirtual.tableWrapStyle}
+                >
                     <table className="data-table">
                         <thead><tr><th>章节</th><th>标题</th><th>字数</th><th>地点</th><th>角色</th></tr></thead>
                         <tbody>
-                            {chapters.map(c => (
+                            {chapterVirtual.topPad > 0 ? (
+                                <tr aria-hidden>
+                                    <td colSpan={5} style={{ height: chapterVirtual.topPad, padding: 0, border: 'none' }} />
+                                </tr>
+                            ) : null}
+                            {visibleChapters.map(c => (
                                 <tr key={c.chapter}>
                                     <td className="chapter-no">第 {c.chapter} 章</td>
                                     <td>{c.title || '—'}</td>
@@ -544,6 +711,11 @@ function ChaptersPage({ refreshSignal }) {
                                     <td className="truncate chapter-characters">{c.characters || '—'}</td>
                                 </tr>
                             ))}
+                            {chapterVirtual.bottomPad > 0 ? (
+                                <tr aria-hidden>
+                                    <td colSpan={5} style={{ height: chapterVirtual.bottomPad, padding: 0, border: 'none' }} />
+                                </tr>
+                            ) : null}
                         </tbody>
                     </table>
                 </div>
@@ -558,22 +730,61 @@ function ChaptersPage({ refreshSignal }) {
 // 页面 5：文档浏览
 // ====================================================================
 
-function FilesPage({ refreshSignal }) {
+function FilesPage({ refreshSignal, stateRefreshSignal }) {
     const [tree, setTree] = useState({})
     const [selectedPath, setSelectedPath] = useState(null)
     const [content, setContent] = useState('')
+    const [treeError, setTreeError] = useState('')
+    const [readError, setReadError] = useState('')
+    const [reloadKey, setReloadKey] = useState(0)
+    const treeSignatureRef = useRef('')
+    const contentSignatureRef = useRef('')
+    const stateDrivenReadSignal = isStateMirrorFile(selectedPath) ? stateRefreshSignal : 0
 
     useEffect(() => {
-        fetchJSON('/api/files/tree').then(setTree).catch(() => { })
-    }, [refreshSignal])
+        const controller = new AbortController()
+        setTreeError('')
+        fetchJSON('/api/files/tree', {}, { signal: controller.signal })
+            .then((rows) => {
+                const nextTree = rows && typeof rows === 'object' ? rows : {}
+                const nextSig = createSimpleSignature(nextTree)
+                if (treeSignatureRef.current === nextSig) return
+                treeSignatureRef.current = nextSig
+                setTree(nextTree)
+            })
+            .catch((err) => {
+                if (isAbortError(err)) return
+                treeSignatureRef.current = ''
+                setTree({})
+                setTreeError('文件树加载失败，请重试')
+            })
+        return () => controller.abort()
+    }, [refreshSignal, reloadKey])
 
     useEffect(() => {
-        if (selectedPath) {
-            fetchJSON('/api/files/read', { path: selectedPath })
-                .then(d => setContent(d.content))
-                .catch(() => setContent('[读取失败]'))
+        if (!selectedPath) {
+            setReadError('')
+            setContent('')
+            contentSignatureRef.current = ''
+            return
         }
-    }, [selectedPath, refreshSignal])
+        const controller = new AbortController()
+        setReadError('')
+        fetchJSON('/api/files/read', { path: selectedPath }, { signal: controller.signal })
+            .then((d) => {
+                const nextContent = String(d?.content || '')
+                const nextSig = `${selectedPath}:${nextContent.length}:${nextContent.slice(0, 240)}:${nextContent.slice(-240)}`
+                if (contentSignatureRef.current === nextSig) return
+                contentSignatureRef.current = nextSig
+                setContent(nextContent)
+            })
+            .catch((err) => {
+                if (isAbortError(err)) return
+                setContent('[读取失败]')
+                setReadError(`文件读取失败：${selectedPath}`)
+            })
+        return () => controller.abort()
+    }, [selectedPath, refreshSignal, stateDrivenReadSignal, reloadKey])
 
     useEffect(() => {
         if (selectedPath) return
@@ -586,6 +797,10 @@ function FilesPage({ refreshSignal }) {
             <div className="page-header">
                 <h2>📁 文档浏览</h2>
             </div>
+            <ErrorNotice
+                message={treeError}
+                onRetry={() => setReloadKey(v => v + 1)}
+            />
             <div className="file-layout">
                 <div className="file-tree-pane">
                     {Object.entries(tree).map(([folder, items]) => (
@@ -601,6 +816,10 @@ function FilesPage({ refreshSignal }) {
                     {selectedPath ? (
                         <div>
                             <div className="selected-path">{selectedPath}</div>
+                            <ErrorNotice
+                                message={readError}
+                                onRetry={() => setReloadKey(v => v + 1)}
+                            />
                             <div className="file-preview">{content}</div>
                         </div>
                     ) : (
@@ -619,10 +838,27 @@ function FilesPage({ refreshSignal }) {
 
 function ReadingPowerPage({ refreshSignal }) {
     const [data, setData] = useState([])
+    const [loadError, setLoadError] = useState('')
+    const [reloadKey, setReloadKey] = useState(0)
 
     useEffect(() => {
-        fetchJSON('/api/reading-power', { limit: 50 }).then(setData).catch(() => { })
-    }, [refreshSignal])
+        const controller = new AbortController()
+        setLoadError('')
+        fetchJSON('/api/reading-power', { limit: 50 }, { signal: controller.signal })
+            .then((rows) => setData(Array.isArray(rows) ? rows : []))
+            .catch((err) => {
+                if (isAbortError(err)) return
+                setData([])
+                setLoadError('追读力数据加载失败，请重试')
+            })
+        return () => controller.abort()
+    }, [refreshSignal, reloadKey])
+    const readingVirtual = useVirtualRows(data.length, {
+        enabled: data.length > 180,
+        rowHeight: 44,
+        maxHeight: 560,
+    })
+    const visibleRows = data.slice(readingVirtual.start, readingVirtual.end)
 
     return (
         <>
@@ -630,12 +866,23 @@ function ReadingPowerPage({ refreshSignal }) {
                 <h2>🔥 追读力分析</h2>
                 <span className="card-badge badge-amber">{data.length} 章数据</span>
             </div>
+            <ErrorNotice message={loadError} onRetry={() => setReloadKey(v => v + 1)} />
             <div className="card">
-                <div className="table-wrap">
+                <div
+                    className="table-wrap"
+                    ref={readingVirtual.containerRef}
+                    onScroll={readingVirtual.onScroll}
+                    style={readingVirtual.tableWrapStyle}
+                >
                     <table className="data-table">
                         <thead><tr><th>章节</th><th>钩子类型</th><th>钩子强度</th><th>过渡章</th><th>Override</th><th>债务余额</th></tr></thead>
                         <tbody>
-                            {data.map(r => (
+                            {readingVirtual.topPad > 0 ? (
+                                <tr aria-hidden>
+                                    <td colSpan={6} style={{ height: readingVirtual.topPad, padding: 0, border: 'none' }} />
+                                </tr>
+                            ) : null}
+                            {visibleRows.map(r => (
                                 <tr key={r.chapter}>
                                     <td className="chapter-no">第 {r.chapter} 章</td>
                                     <td>{r.hook_type || '—'}</td>
@@ -649,6 +896,11 @@ function ReadingPowerPage({ refreshSignal }) {
                                     <td className={r.debt_balance > 0 ? 'debt-positive' : 'debt-normal'}>{(r.debt_balance || 0).toFixed(2)}</td>
                                 </tr>
                             ))}
+                            {readingVirtual.bottomPad > 0 ? (
+                                <tr aria-hidden>
+                                    <td colSpan={6} style={{ height: readingVirtual.bottomPad, padding: 0, border: 'none' }} />
+                                </tr>
+                            ) : null}
                         </tbody>
                     </table>
                 </div>
@@ -684,63 +936,139 @@ function walkFirstFile(items) {
 // 数据总览内嵌：全量数据视图
 // ====================================================================
 
-const MergedDataView = memo(function MergedDataView() {
-    const [loading, setLoading] = useState(true)
+const MergedDataView = memo(function MergedDataView({ refreshSignal }) {
+    const [expanded, setExpanded] = useState(false)
+    const [loading, setLoading] = useState(false)
     const [payload, setPayload] = useState({})
-    const [domain, setDomain] = useState('overview')
+    const [loadedGroups, setLoadedGroups] = useState({})
+    const [loadError, setLoadError] = useState('')
+    const [autoRefresh, setAutoRefresh] = useState(false)
+    const [staleHint, setStaleHint] = useState(false)
+    const [reloadKey, setReloadKey] = useState(0)
+    const [domain, setDomain] = useState('core')
+    const payloadSignatureRef = useRef('')
+    const payloadRef = useRef({})
+    const loadedGroupsRef = useRef({})
+    const manualRefreshSeedRef = useRef(0)
+    const lastReloadKeyRef = useRef(0)
+    const lastRefreshTokenRef = useRef(0)
+    const refreshToken = autoRefresh ? refreshSignal : 0
+
+    useEffect(() => { payloadRef.current = payload }, [payload])
+    useEffect(() => { loadedGroupsRef.current = loadedGroups }, [loadedGroups])
 
     useEffect(() => {
+        if (!expanded) return
+
         let disposed = false
+        const controller = new AbortController()
 
-        async function loadAll() {
-            setLoading(true)
-            const requests = [
-                ['entities', fetchJSON('/api/entities')],
-                ['chapters', fetchJSON('/api/chapters')],
-                ['scenes', fetchJSON('/api/scenes', { limit: 200 })],
-                ['relationships', fetchJSON('/api/relationships', { limit: 300 })],
-                ['relationshipEvents', fetchJSON('/api/relationship-events', { limit: 200 })],
-                ['readingPower', fetchJSON('/api/reading-power', { limit: 100 })],
-                ['reviewMetrics', fetchJSON('/api/review-metrics', { limit: 50 })],
-                ['stateChanges', fetchJSON('/api/state-changes', { limit: 120 })],
-                ['aliases', fetchJSON('/api/aliases')],
-                ['overrides', fetchJSON('/api/overrides', { limit: 120 })],
-                ['debts', fetchJSON('/api/debts', { limit: 120 })],
-                ['debtEvents', fetchJSON('/api/debt-events', { limit: 150 })],
-                ['invalidFacts', fetchJSON('/api/invalid-facts', { limit: 120 })],
-                ['ragQueries', fetchJSON('/api/rag-queries', { limit: 150 })],
-                ['toolStats', fetchJSON('/api/tool-stats', { limit: 200 })],
-                ['checklistScores', fetchJSON('/api/checklist-scores', { limit: 120 })],
-            ]
+        const refreshChanged = refreshToken !== lastRefreshTokenRef.current
+        lastRefreshTokenRef.current = refreshToken
 
-            const entries = await Promise.all(
-                requests.map(async ([key, p]) => {
-                    try {
-                        const val = await p
-                        return [key, val]
-                    } catch {
-                        return [key, []]
-                    }
-                }),
-            )
-            if (!disposed) {
-                setPayload(Object.fromEntries(entries))
-                setLoading(false)
+        const manualReload = reloadKey !== lastReloadKeyRef.current
+        if (manualReload) lastReloadKeyRef.current = reloadKey
+
+        const forceReload = manualReload || (autoRefresh && refreshChanged)
+        const targetKeys = getDomainGroupKeys(domain)
+        const pendingKeys = forceReload
+            ? targetKeys
+            : targetKeys.filter((key) => !loadedGroupsRef.current[key])
+
+        if (pendingKeys.length === 0) {
+            setLoading(false)
+            return () => {
+                disposed = true
+                controller.abort()
             }
         }
 
-        loadAll()
-        return () => { disposed = true }
-    }, [])
+        async function loadDomainGroups() {
+            setLoading(true)
+            setLoadError('')
+            const failedGroups = []
+            const loadedEntries = await Promise.all(
+                pendingKeys.map(async (key) => {
+                    try {
+                        const rows = await fetchFullDataGroup(key, controller.signal)
+                        return [key, rows]
+                    } catch (err) {
+                        if (!isAbortError(err)) failedGroups.push(key)
+                        return [key, null]
+                    }
+                }),
+            )
+
+            if (disposed) return
+
+            const nextPayload = { ...payloadRef.current }
+            const nextLoaded = { ...loadedGroupsRef.current }
+            for (const [key, rows] of loadedEntries) {
+                if (!Array.isArray(rows)) continue
+                nextPayload[key] = rows
+                nextLoaded[key] = true
+            }
+
+            const nextSignature = createMergedPayloadSignature(nextPayload)
+            if (payloadSignatureRef.current !== nextSignature) {
+                payloadSignatureRef.current = nextSignature
+                setPayload(nextPayload)
+            }
+            setLoadedGroups(nextLoaded)
+
+            if (failedGroups.length > 0) {
+                setLoadError(`部分分组加载失败：${failedGroups.join(', ')}`)
+            }
+            setStaleHint(false)
+            setLoading(false)
+        }
+
+        loadDomainGroups().catch((err) => {
+            if (isAbortError(err) || disposed) return
+            setLoadError('全量数据加载失败，请重试')
+            setLoading(false)
+        })
+        return () => {
+            disposed = true
+            controller.abort()
+        }
+    }, [autoRefresh, domain, expanded, refreshToken, reloadKey])
+
+    useEffect(() => {
+        if (!expanded || autoRefresh) return
+        if (refreshSignal <= manualRefreshSeedRef.current) return
+        setStaleHint(true)
+    }, [expanded, autoRefresh, refreshSignal])
+
+    if (!expanded) {
+        return (
+            <div className="card dashboard-section-card">
+                <div className="card-header">
+                    <span className="card-title">🧪 全量数据视图</span>
+                    <button
+                        className="filter-btn"
+                        type="button"
+                        onClick={() => setExpanded(true)}
+                    >
+                        展开查看
+                    </button>
+                </div>
+                <p className="stat-sub" style={{ margin: 0 }}>
+                    默认折叠以降低页面刷新负载。点击后按当前快照拉取全量数据。
+                </p>
+            </div>
+        )
+    }
 
     if (loading) return <div className="loading">加载全量数据中…</div>
 
-    const groups = domain === 'overview'
-        ? FULL_DATA_GROUPS
-        : FULL_DATA_GROUPS.filter(g => g.domain === domain)
+    const groups = getDomainGroups(domain)
+    const renderedGroups = domain === 'overview' ? [] : groups
     const totalRows = FULL_DATA_GROUPS.reduce((sum, g) => sum + (payload[g.key] || []).length, 0)
     const nonEmptyGroups = FULL_DATA_GROUPS.filter(g => (payload[g.key] || []).length > 0).length
+    const loadedGroupCount = FULL_DATA_GROUPS.filter(g => loadedGroups[g.key]).length
     const maxChapter = FULL_DATA_GROUPS.reduce((max, g) => {
+        if (!loadedGroups[g.key]) return max
         const rows = payload[g.key] || []
         rows.slice(0, 120).forEach(r => {
             const c = extractChapter(r)
@@ -749,11 +1077,13 @@ const MergedDataView = memo(function MergedDataView() {
         return max
     }, 0)
     const domainStats = FULL_DATA_DOMAINS.filter(d => d.id !== 'overview').map(d => {
-        const ds = FULL_DATA_GROUPS.filter(g => g.domain === d.id)
+        const ds = getDomainGroups(d.id)
         const rowCount = ds.reduce((sum, g) => sum + (payload[g.key] || []).length, 0)
         const filled = ds.filter(g => (payload[g.key] || []).length > 0).length
-        return { ...d, rowCount, filled, total: ds.length }
+        const loaded = ds.filter(g => loadedGroups[g.key]).length
+        return { ...d, rowCount, filled, total: ds.length, loaded }
     })
+    const currentDomainLoaded = groups.filter(g => loadedGroups[g.key]).length
 
     return (
         <>
@@ -761,6 +1091,37 @@ const MergedDataView = memo(function MergedDataView() {
                 <h2>🧪 全量数据视图</h2>
                 <span className="card-badge badge-cyan">{FULL_DATA_GROUPS.length} 类数据源</span>
             </div>
+
+            <div className="filter-group">
+                <button
+                    className="filter-btn"
+                    type="button"
+                    onClick={() => {
+                        manualRefreshSeedRef.current = refreshSignal
+                        setReloadKey(v => v + 1)
+                    }}
+                >
+                    {domain === 'overview' ? '刷新所有分组' : '刷新当前分组'}
+                </button>
+                <button
+                    className={`filter-btn ${autoRefresh ? 'active' : ''}`}
+                    type="button"
+                    onClick={() => setAutoRefresh(v => !v)}
+                >
+                    {autoRefresh ? '自动刷新：开' : '自动刷新：关'}
+                </button>
+                <button className="filter-btn" type="button" onClick={() => setExpanded(false)}>
+                    收起
+                </button>
+            </div>
+            {staleHint ? (
+                <div className="loading" style={{ marginBottom: 12 }}>
+                    检测到新数据，点击“
+                    {domain === 'overview' ? '刷新所有分组' : '刷新当前分组'}
+                    ”以更新视图。
+                </div>
+            ) : null}
+            <ErrorNotice message={loadError} onRetry={() => setReloadKey(v => v + 1)} />
 
             <div className="demo-summary-grid">
                 <div className="card stat-card">
@@ -771,7 +1132,7 @@ const MergedDataView = memo(function MergedDataView() {
                 <div className="card stat-card">
                     <span className="stat-label">已覆盖数据源</span>
                     <span className="stat-value plain">{nonEmptyGroups}/{FULL_DATA_GROUPS.length}</span>
-                    <span className="stat-sub">有数据的表 / 总表数</span>
+                    <span className="stat-sub">有数据的表 / 总表数（已加载 {loadedGroupCount}）</span>
                 </div>
                 <div className="card stat-card">
                     <span className="stat-label">最新章节触达</span>
@@ -781,7 +1142,7 @@ const MergedDataView = memo(function MergedDataView() {
                 <div className="card stat-card">
                     <span className="stat-label">当前视图</span>
                     <span className="stat-value plain">{FULL_DATA_DOMAINS.find(d => d.id === domain)?.label}</span>
-                    <span className="stat-sub">{groups.length} 个数据分组</span>
+                    <span className="stat-sub">{groups.length} 个分组（已加载 {currentDomainLoaded}）</span>
                 </div>
             </div>
 
@@ -803,16 +1164,27 @@ const MergedDataView = memo(function MergedDataView() {
                         <div className="card" key={ds.id}>
                             <div className="card-header">
                                 <span className="card-title">{ds.label}</span>
-                                <span className="card-badge badge-purple">{ds.filled}/{ds.total}</span>
+                                <span className="card-badge badge-purple">{ds.loaded}/{ds.total}</span>
                             </div>
                             <div className="domain-stat-number">{formatNumber(ds.rowCount)}</div>
-                            <div className="stat-sub">该数据域总记录数</div>
+                            <div className="stat-sub">该数据域总记录数（非空分组 {ds.filled}）</div>
                         </div>
                     ))}
                 </div>
             ) : null}
 
-            {groups.map(g => {
+            {domain === 'overview' ? (
+                <div className="card">
+                    <div className="card-header">
+                        <span className="card-title">总览模式</span>
+                    </div>
+                    <p className="stat-sub" style={{ margin: 0 }}>
+                        总览仅展示聚合统计。切换到具体数据域后，会按需加载并展示该域明细表。
+                    </p>
+                </div>
+            ) : null}
+
+            {renderedGroups.map(g => {
                 const count = (payload[g.key] || []).length
                 return (
                     <div className="card demo-group-card" key={g.key}>
@@ -893,6 +1265,22 @@ function MiniTable({ rows, columns, pageSize = 12 }) {
     )
 }
 
+function getDomainGroups(domain) {
+    if (domain === 'overview') return FULL_DATA_GROUPS
+    return FULL_DATA_GROUPS.filter((g) => g.domain === domain)
+}
+
+function getDomainGroupKeys(domain) {
+    return getDomainGroups(domain).map((g) => g.key)
+}
+
+async function fetchFullDataGroup(key, signal) {
+    const req = FULL_DATA_REQUESTS[key]
+    if (!req?.path) return []
+    const data = await fetchJSON(req.path, req.params || {}, { signal })
+    return Array.isArray(data) ? data : []
+}
+
 function extractChapter(row) {
     if (!row || typeof row !== 'object') return 0
     const candidates = [
@@ -908,6 +1296,223 @@ function extractChapter(row) {
         if (Number.isFinite(n) && n > 0) return n
     }
     return 0
+}
+
+function createMergedPayloadSignature(payload) {
+    if (!payload || typeof payload !== 'object') return ''
+    const keys = Object.keys(payload).sort()
+    const chunks = []
+    for (const key of keys) {
+        const rows = Array.isArray(payload[key]) ? payload[key] : []
+        const sampleIndexes = buildSampleIndexes(rows.length, 12)
+        const sampleSig = sampleIndexes.map((idx) => extractIdentity(rows[idx])).join(';')
+        chunks.push(`${key}:${rows.length}:${sampleSig}`)
+    }
+    return chunks.join('|')
+}
+
+function buildSampleIndexes(length, sampleCount = 12) {
+    if (!Number.isFinite(length) || length <= 0) return []
+    if (length <= sampleCount) return Array.from({ length }, (_, i) => i)
+    const indexes = new Set([0, length - 1, Math.floor(length / 2)])
+    const step = (length - 1) / (sampleCount - 1)
+    for (let i = 0; i < sampleCount; i += 1) {
+        indexes.add(Math.floor(i * step))
+    }
+    return [...indexes].sort((a, b) => a - b)
+}
+
+function extractIdentity(row) {
+    if (!row || typeof row !== 'object') return '-'
+    const preferredKeys = [
+        'id',
+        'chapter',
+        'start_chapter',
+        'end_chapter',
+        'entity_id',
+        'alias',
+        'query',
+        'created_at',
+    ]
+    for (const key of preferredKeys) {
+        const v = row[key]
+        if (v !== undefined && v !== null && String(v) !== '') {
+            return `${key}=${String(v)}`
+        }
+    }
+    const keys = Object.keys(row).slice(0, 4).sort()
+    return keys.map((k) => `${k}=${String(row[k])}`).join(',')
+}
+
+function isStateMirrorFile(path) {
+    if (!path) return false
+    const normalized = String(path).replace(/\\/g, '/').toLowerCase()
+    return (
+        normalized.endsWith('.webnovel/state.json')
+        || normalized.endsWith('.webnovel/workflow_state.json')
+    )
+}
+
+function isDbRefreshActivePage(page) {
+    return page === 'entities' || page === 'graph' || page === 'chapters' || page === 'reading'
+}
+
+function createSimpleSignature(value) {
+    try {
+        return JSON.stringify(value)
+    } catch {
+        return String(value)
+    }
+}
+
+function createRefreshDebugState() {
+    return {
+        state: { queued: 0, fired: 0, lastAt: 0, lastSource: '-' },
+        db: { queued: 0, fired: 0, lastAt: 0, lastSource: '-' },
+        files: { queued: 0, fired: 0, lastAt: 0, lastSource: '-' },
+    }
+}
+
+function loadRefreshDebugEnabled() {
+    if (typeof window === 'undefined') return false
+    try {
+        return window.localStorage.getItem('webnovel-dashboard-refresh-debug') === '1'
+    } catch {
+        return false
+    }
+}
+
+function saveRefreshDebugEnabled(enabled) {
+    if (typeof window === 'undefined') return
+    try {
+        window.localStorage.setItem('webnovel-dashboard-refresh-debug', enabled ? '1' : '0')
+    } catch {
+        // ignore storage failures
+    }
+}
+
+function useVirtualRows(totalRows, options = {}) {
+    const {
+        enabled = false,
+        rowHeight = 44,
+        maxHeight = 560,
+        overscan = 8,
+    } = options
+    const containerRef = useRef(null)
+    const [windowRange, setWindowRange] = useState(() => (
+        enabled
+            ? computeVirtualWindow({ totalRows, rowHeight, overscan, scrollTop: 0, viewportHeight: maxHeight })
+            : computeVirtualWindow({ totalRows, rowHeight, overscan, scrollTop: 0, viewportHeight: totalRows * rowHeight })
+    ))
+
+    const recompute = useCallback(() => {
+        const viewportHeight = enabled
+            ? (containerRef.current?.clientHeight || maxHeight)
+            : (totalRows * rowHeight)
+        const scrollTop = enabled
+            ? (containerRef.current?.scrollTop || 0)
+            : 0
+        setWindowRange(computeVirtualWindow({
+            totalRows,
+            rowHeight,
+            overscan,
+            scrollTop,
+            viewportHeight,
+        }))
+    }, [enabled, maxHeight, overscan, rowHeight, totalRows])
+
+    useEffect(() => {
+        recompute()
+    }, [recompute, totalRows])
+
+    useEffect(() => {
+        if (!enabled) return () => { }
+        const onResize = () => recompute()
+        window.addEventListener('resize', onResize)
+        return () => window.removeEventListener('resize', onResize)
+    }, [enabled, recompute])
+
+    return {
+        ...windowRange,
+        containerRef,
+        onScroll: enabled ? recompute : undefined,
+        tableWrapStyle: enabled ? { maxHeight, overflowY: 'auto' } : undefined,
+    }
+}
+
+function computeVirtualWindow({ totalRows, rowHeight, overscan, scrollTop, viewportHeight }) {
+    const total = Math.max(0, Number(totalRows) || 0)
+    if (total === 0) {
+        return { start: 0, end: 0, topPad: 0, bottomPad: 0 }
+    }
+    const safeRowHeight = Math.max(1, Number(rowHeight) || 44)
+    const safeOverscan = Math.max(0, Number(overscan) || 0)
+    const visibleCount = Math.max(1, Math.ceil((Number(viewportHeight) || safeRowHeight) / safeRowHeight))
+    const rawStart = Math.floor((Number(scrollTop) || 0) / safeRowHeight)
+    const start = Math.max(0, rawStart - safeOverscan)
+    const end = Math.min(total, start + visibleCount + safeOverscan * 2)
+    const topPad = start * safeRowHeight
+    const bottomPad = Math.max(0, (total - end) * safeRowHeight)
+    return { start, end, topPad, bottomPad }
+}
+
+function RefreshDebugPanel({ open, onToggle, page, isPageVisible, stats, trace, pending }) {
+    return (
+        <div className="card" style={{ marginTop: 12, padding: 10 }}>
+            <div className="card-header" style={{ marginBottom: 6 }}>
+                <span className="card-title">Refresh 调试</span>
+                <button className="filter-btn" type="button" onClick={onToggle}>
+                    {open ? '收起' : '展开'}
+                </button>
+            </div>
+            <div className="stat-sub">页面: {page} · 可见: {isPageVisible ? '是' : '否'}</div>
+            {!open ? null : (
+                <>
+                    <div className="table-wrap" style={{ marginTop: 8 }}>
+                        <table className="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Scope</th>
+                                    <th>Queued</th>
+                                    <th>Fired</th>
+                                    <th>Pending</th>
+                                    <th>Last Source</th>
+                                    <th>Last At</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {['state', 'db', 'files'].map((scope) => (
+                                    <tr key={scope}>
+                                        <td>{scope}</td>
+                                        <td>{stats?.[scope]?.queued || 0}</td>
+                                        <td>{stats?.[scope]?.fired || 0}</td>
+                                        <td>{pending?.[scope] ? 'yes' : 'no'}</td>
+                                        <td className="truncate" style={{ maxWidth: 180 }}>{stats?.[scope]?.lastSource || '-'}</td>
+                                        <td>{formatTime(stats?.[scope]?.lastAt)}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div className="card-title" style={{ marginTop: 10, marginBottom: 6 }}>最近事件</div>
+                    <div style={{ maxHeight: 180, overflowY: 'auto', fontSize: 12, lineHeight: 1.45 }}>
+                        {trace.length === 0 ? (
+                            <div className="stat-sub">暂无事件</div>
+                        ) : trace.map((evt) => (
+                            <div key={evt.id} style={{ padding: '2px 0' }}>
+                                [{formatTime(evt.ts)}] {evt.scope} · {evt.phase} · {evt.source}
+                            </div>
+                        ))}
+                    </div>
+                </>
+            )}
+        </div>
+    )
+}
+
+function formatTime(ts) {
+    if (!ts) return '-'
+    return new Date(ts).toLocaleTimeString('zh-CN', { hour12: false })
 }
 
 
@@ -964,6 +1569,25 @@ function TreeNodes({ items, selected, onSelect, depth = 0 }) {
 // ====================================================================
 // 辅助：数字格式化
 // ====================================================================
+
+function ErrorNotice({ message, onRetry }) {
+    if (!message) return null
+    return (
+        <div className="card" style={{ marginBottom: 12 }}>
+            <div className="card-header">
+                <span className="card-title">⚠️ 数据加载异常</span>
+                <button className="filter-btn" type="button" onClick={onRetry}>
+                    重试
+                </button>
+            </div>
+            <p className="stat-sub" style={{ margin: 0 }}>{message}</p>
+        </div>
+    )
+}
+
+function isAbortError(err) {
+    return err?.name === 'AbortError'
+}
 
 function formatNumber(n) {
     if (n >= 10000) return new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 1 }).format(n / 10000) + ' 万'

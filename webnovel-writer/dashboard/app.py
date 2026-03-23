@@ -95,6 +95,28 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
             raise HTTPException(404, "state.json 不存在")
         return json.loads(state_path.read_text(encoding="utf-8-sig"))
 
+    @app.get("/api/db/revision")
+    def db_revision():
+        """
+        返回 index.db 相关文件的轻量 revision 签名（mtime+size）。
+        用于前端低频轮询，感知“仅数据库更新”的场景。
+        """
+        base = _webnovel_dir()
+        targets = (
+            base / "index.db",
+            base / "index.db-wal",
+        )
+        parts: list[str] = []
+        for p in targets:
+            if not p.exists():
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}")
+        return {"revision": "|".join(parts)}
+
     # ===========================================================
     # API：实体数据库（index.db 只读查询）
     # ===========================================================

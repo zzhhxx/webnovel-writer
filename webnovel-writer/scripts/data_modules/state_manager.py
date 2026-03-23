@@ -95,6 +95,33 @@ class StateManager:
     # v5.0 引入的实体类型
     ENTITY_TYPES = ["角色", "地点", "物品", "势力", "招式"]
     SQLITE_RETRY_KEY = "_sqlite_sync_pending"
+    BACKFILL_ALL_DOMAINS = (
+        "chapters",
+        "reading_power",
+        "entities",
+        "aliases",
+        "state_changes",
+        "relationships",
+        "appearances",
+    )
+    BACKFILL_DOMAIN_ALIASES = {
+        "chapter": "chapters",
+        "chapters": "chapters",
+        "reading": "reading_power",
+        "reading_power": "reading_power",
+        "reading-power": "reading_power",
+        "entities": "entities",
+        "entity": "entities",
+        "aliases": "aliases",
+        "alias": "aliases",
+        "state_changes": "state_changes",
+        "state-change": "state_changes",
+        "state-change-log": "state_changes",
+        "relationships": "relationships",
+        "relationship": "relationships",
+        "appearances": "appearances",
+        "appearance": "appearances",
+    }
 
     def __init__(self, config=None, enable_sqlite_sync: bool = True):
         """
@@ -1580,12 +1607,25 @@ class StateManager:
         if isinstance(progress, dict):
             _add(progress.get("current_chapter"), "state.progress")
 
-        # 来源5：SQLite 现有章节信号（允许缺少某些表）
+        # 来源5：state.state_changes / state.structured_relationships
+        for change in self._state.get("state_changes", []) or []:
+            if not isinstance(change, dict):
+                continue
+            _add(change.get("chapter"), "state.state_changes")
+
+        for rel in self._state.get("structured_relationships", []) or []:
+            if not isinstance(rel, dict):
+                continue
+            _add(rel.get("chapter"), "state.structured_relationships")
+
+        # 来源6：SQLite 现有章节信号（允许缺少某些表）
         table_sources = [
             ("chapters", "db.chapters"),
             ("scenes", "db.scenes"),
             ("appearances", "db.appearances"),
             ("chapter_reading_power", "db.chapter_reading_power"),
+            ("state_changes", "db.state_changes"),
+            ("relationships", "db.relationships"),
         ]
         try:
             with index_manager._get_conn() as conn:
@@ -1803,6 +1843,589 @@ class StateManager:
             "has_signal": has_signal,
         }
 
+    @staticmethod
+    def _stringify_json_scalar(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (dict, list)):
+            try:
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)
+            except TypeError:
+                return str(value)
+        return str(value)
+
+    @staticmethod
+    def _new_backfill_report_bucket(enabled: bool) -> Dict[str, Any]:
+        return {
+            "enabled": bool(enabled),
+            "already_present": 0,
+            "missing": 0,
+            "repaired": 0,
+            "failed": 0,
+            "repaired_items": [],
+            "failed_items": [],
+            "preview": [],
+        }
+
+    def _is_chapter_in_backfill_range(
+        self,
+        chapter: int,
+        from_chapter: Optional[int],
+        to_chapter: Optional[int],
+    ) -> bool:
+        if chapter <= 0:
+            return False
+        if from_chapter is not None and chapter < int(from_chapter):
+            return False
+        if to_chapter is not None and chapter > int(to_chapter):
+            return False
+        return True
+
+    @staticmethod
+    def _ranges_overlap_with_backfill(
+        start: int,
+        end: int,
+        from_chapter: Optional[int],
+        to_chapter: Optional[int],
+    ) -> bool:
+        if start <= 0 and end <= 0:
+            return True
+        if start <= 0:
+            start = end
+        if end <= 0:
+            end = start
+        lo = int(from_chapter) if from_chapter is not None else -10**9
+        hi = int(to_chapter) if to_chapter is not None else 10**9
+        return not (end < lo or start > hi)
+
+    def _normalize_backfill_domains(
+        self,
+        only: Optional[List[str]] = None,
+        skip: Optional[List[str]] = None,
+        *,
+        include_reading_power: bool = True,
+    ) -> set[str]:
+        def _iter_tokens(values: Optional[List[str]]) -> List[str]:
+            tokens: List[str] = []
+            for raw in values or []:
+                if raw is None:
+                    continue
+                text = str(raw).strip()
+                if not text:
+                    continue
+                for part in re.split(r"[,，;\s]+", text):
+                    part = part.strip()
+                    if part:
+                        tokens.append(part)
+            return tokens
+
+        invalid_tokens: List[str] = []
+
+        def _decode(values: Optional[List[str]]) -> set[str]:
+            decoded: set[str] = set()
+            for token in _iter_tokens(values):
+                mapped = self.BACKFILL_DOMAIN_ALIASES.get(token.lower())
+                if not mapped:
+                    invalid_tokens.append(token)
+                    continue
+                decoded.add(mapped)
+            return decoded
+
+        only_domains = _decode(only)
+        skip_domains = _decode(skip)
+        if invalid_tokens:
+            raise ValueError(f"未知回填数据域: {', '.join(sorted(set(invalid_tokens)))}")
+
+        selected = set(only_domains) if only_domains else set(self.BACKFILL_ALL_DOMAINS)
+        selected -= skip_domains
+        if not include_reading_power:
+            selected.discard("reading_power")
+        return selected
+
+    def _collect_backfill_entity_candidates(
+        self,
+        *,
+        from_chapter: Optional[int] = None,
+        to_chapter: Optional[int] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        candidates: Dict[str, Dict[str, Any]] = {}
+
+        def _ensure(entity_id: str) -> Dict[str, Any]:
+            entry = candidates.get(entity_id)
+            if entry is None:
+                entry = {
+                    "id": entity_id,
+                    "type": "角色",
+                    "canonical_name": entity_id,
+                    "tier": "装饰",
+                    "desc": "",
+                    "current": {},
+                    "first_appearance": 0,
+                    "last_appearance": 0,
+                    "is_protagonist": False,
+                    "sources": set(),
+                }
+                candidates[entity_id] = entry
+            return entry
+
+        def _touch_appearance(entry: Dict[str, Any], chapter: int) -> None:
+            if chapter <= 0:
+                return
+            first = self._to_int(entry.get("first_appearance"), default=0)
+            last = self._to_int(entry.get("last_appearance"), default=0)
+            if first <= 0 or chapter < first:
+                entry["first_appearance"] = chapter
+            if last <= 0 or chapter > last:
+                entry["last_appearance"] = chapter
+
+        entities_v3 = self._state.get("entities_v3", {})
+        if isinstance(entities_v3, dict):
+            for entity_type, bucket in entities_v3.items():
+                if not isinstance(bucket, dict):
+                    continue
+                normalized_type = str(entity_type or "").strip() or "角色"
+                for raw_id, raw_data in bucket.items():
+                    entity_id = str(raw_id or "").strip()
+                    if not entity_id:
+                        continue
+                    data = raw_data if isinstance(raw_data, dict) else {}
+
+                    first = self._to_int(data.get("first_appearance"), default=0)
+                    last = self._to_int(data.get("last_appearance"), default=0)
+                    if last <= 0 and first > 0:
+                        last = first
+                    if first <= 0 and last > 0:
+                        first = last
+                    if (
+                        (from_chapter is not None or to_chapter is not None)
+                        and (first > 0 or last > 0)
+                        and not self._ranges_overlap_with_backfill(first, last, from_chapter, to_chapter)
+                    ):
+                        continue
+
+                    entry = _ensure(entity_id)
+                    entry["type"] = str(data.get("type") or normalized_type or entry["type"]).strip() or "角色"
+                    entry["canonical_name"] = (
+                        str(data.get("canonical_name") or data.get("name") or entry["canonical_name"]).strip()
+                        or entity_id
+                    )
+                    entry["tier"] = str(data.get("tier") or entry.get("tier") or "装饰").strip() or "装饰"
+                    entry["desc"] = str(data.get("desc") or entry.get("desc") or "").strip()
+                    entry["is_protagonist"] = bool(entry.get("is_protagonist")) or self._to_bool(
+                        data.get("is_protagonist"),
+                        default=False,
+                    )
+
+                    current = data.get("current", {})
+                    if isinstance(current, str):
+                        try:
+                            parsed = json.loads(current)
+                            current = parsed if isinstance(parsed, dict) else {}
+                        except json.JSONDecodeError:
+                            current = {}
+                    if isinstance(current, dict):
+                        merged = dict(entry.get("current") or {})
+                        merged.update(current)
+                        entry["current"] = merged
+
+                    if first > 0:
+                        _touch_appearance(entry, first)
+                    if last > 0:
+                        _touch_appearance(entry, last)
+                    entry["sources"].add("state.entities_v3")
+
+        alias_index = self._state.get("alias_index", {})
+        if isinstance(alias_index, dict):
+            for alias, entries in alias_index.items():
+                if not isinstance(entries, list):
+                    continue
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    entity_id = str(item.get("id") or item.get("entity_id") or "").strip()
+                    if not entity_id:
+                        continue
+                    entry = _ensure(entity_id)
+                    alias_type = str(item.get("type") or "").strip()
+                    if alias_type:
+                        entry["type"] = alias_type
+                    alias_text = str(alias or "").strip()
+                    if alias_text and (not str(entry.get("canonical_name") or "").strip() or entry["canonical_name"] == entity_id):
+                        entry["canonical_name"] = alias_text
+                    entry["sources"].add("state.alias_index")
+
+        state_changes = self._state.get("state_changes", [])
+        if isinstance(state_changes, list):
+            for change in state_changes:
+                if not isinstance(change, dict):
+                    continue
+                entity_id = str(change.get("entity_id") or "").strip()
+                if not entity_id:
+                    continue
+                chapter = self._to_int(change.get("chapter"), default=0)
+                if chapter > 0 and not self._is_chapter_in_backfill_range(chapter, from_chapter, to_chapter):
+                    continue
+                if chapter <= 0 and (from_chapter is not None or to_chapter is not None):
+                    continue
+                entry = _ensure(entity_id)
+                _touch_appearance(entry, chapter)
+                entry["sources"].add("state.state_changes")
+
+        relationships = self._state.get("structured_relationships", [])
+        if isinstance(relationships, list):
+            for rel in relationships:
+                if not isinstance(rel, dict):
+                    continue
+                chapter = self._to_int(rel.get("chapter"), default=0)
+                if chapter > 0 and not self._is_chapter_in_backfill_range(chapter, from_chapter, to_chapter):
+                    continue
+                if chapter <= 0 and (from_chapter is not None or to_chapter is not None):
+                    continue
+                for field in ("from", "from_entity", "to", "to_entity"):
+                    entity_id = str(rel.get(field) or "").strip()
+                    if not entity_id:
+                        continue
+                    entry = _ensure(entity_id)
+                    _touch_appearance(entry, chapter)
+                    entry["sources"].add("state.structured_relationships")
+
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for entity_id, entry in candidates.items():
+            first = max(0, self._to_int(entry.get("first_appearance"), default=0))
+            last = max(0, self._to_int(entry.get("last_appearance"), default=0))
+            if first > 0 and last <= 0:
+                last = first
+            elif last > 0 and first <= 0:
+                first = last
+            if first > 0 and last > 0 and last < first:
+                first, last = last, first
+
+            normalized[entity_id] = {
+                "id": entity_id,
+                "type": str(entry.get("type") or "角色").strip() or "角色",
+                "canonical_name": str(entry.get("canonical_name") or entity_id).strip() or entity_id,
+                "tier": str(entry.get("tier") or "装饰").strip() or "装饰",
+                "desc": str(entry.get("desc") or "").strip(),
+                "current": entry.get("current") if isinstance(entry.get("current"), dict) else {},
+                "first_appearance": first,
+                "last_appearance": last,
+                "is_protagonist": bool(entry.get("is_protagonist")),
+                "sources": sorted(entry.get("sources") or []),
+            }
+        return normalized
+
+    def _collect_backfill_alias_candidates(
+        self,
+        entity_candidates: Dict[str, Dict[str, Any]],
+    ) -> Dict[tuple[str, str, str], Dict[str, Any]]:
+        candidates: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        entity_type_map = {
+            str(entity_id): str(item.get("type") or "角色").strip() or "角色"
+            for entity_id, item in entity_candidates.items()
+        }
+
+        def _add(alias: str, entity_id: str, entity_type: str, source: str) -> None:
+            alias = str(alias or "").strip()
+            entity_id = str(entity_id or "").strip()
+            entity_type = str(entity_type or entity_type_map.get(entity_id) or "角色").strip() or "角色"
+            if not alias or not entity_id:
+                return
+            key = (alias, entity_id, entity_type)
+            item = candidates.get(key)
+            if item is None:
+                item = {
+                    "alias": alias,
+                    "entity_id": entity_id,
+                    "entity_type": entity_type,
+                    "sources": set(),
+                }
+                candidates[key] = item
+            item["sources"].add(source)
+
+        alias_index = self._state.get("alias_index", {})
+        if isinstance(alias_index, dict):
+            for alias, entries in alias_index.items():
+                if not isinstance(entries, list):
+                    continue
+                for row in entries:
+                    if not isinstance(row, dict):
+                        continue
+                    _add(alias, row.get("id") or row.get("entity_id"), row.get("type"), "state.alias_index")
+
+        entities_v3 = self._state.get("entities_v3", {})
+        if isinstance(entities_v3, dict):
+            for entity_type, bucket in entities_v3.items():
+                if not isinstance(bucket, dict):
+                    continue
+                for raw_id, row in bucket.items():
+                    entity_id = str(raw_id or "").strip()
+                    if not entity_id:
+                        continue
+                    if entity_candidates and entity_id not in entity_candidates:
+                        continue
+                    data = row if isinstance(row, dict) else {}
+                    canonical_name = str(data.get("canonical_name") or data.get("name") or "").strip()
+                    if canonical_name:
+                        _add(canonical_name, entity_id, entity_type, "state.entities_v3")
+                    for alias in self._coerce_string_list(data.get("aliases")):
+                        _add(alias, entity_id, entity_type, "state.entities_v3")
+
+        for entity_id, item in entity_candidates.items():
+            canonical_name = str(item.get("canonical_name") or "").strip()
+            if canonical_name:
+                _add(canonical_name, entity_id, item.get("type"), "backfill.entities")
+
+        normalized: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        for key, item in candidates.items():
+            normalized[key] = {
+                "alias": item["alias"],
+                "entity_id": item["entity_id"],
+                "entity_type": item["entity_type"],
+                "sources": sorted(item.get("sources") or []),
+            }
+        return normalized
+
+    def _collect_backfill_state_change_candidates(
+        self,
+        *,
+        from_chapter: Optional[int] = None,
+        to_chapter: Optional[int] = None,
+    ) -> Dict[tuple[str, str, str, str, int], Dict[str, Any]]:
+        candidates: Dict[tuple[str, str, str, str, int], Dict[str, Any]] = {}
+        for raw in self._state.get("state_changes", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            entity_id = str(raw.get("entity_id") or "").strip()
+            if not entity_id:
+                continue
+            chapter = self._to_int(raw.get("chapter"), default=0)
+            if chapter > 0 and not self._is_chapter_in_backfill_range(chapter, from_chapter, to_chapter):
+                continue
+            if chapter <= 0 and (from_chapter is not None or to_chapter is not None):
+                continue
+
+            payload = {
+                "entity_id": entity_id,
+                "field": str(raw.get("field") or "").strip(),
+                "old_value": self._stringify_json_scalar(raw.get("old", raw.get("old_value", ""))),
+                "new_value": self._stringify_json_scalar(raw.get("new", raw.get("new_value", ""))),
+                "reason": str(raw.get("reason") or "").strip(),
+                "chapter": int(chapter),
+                "sources": ["state.state_changes"],
+            }
+            key = self._normalize_state_change_key(payload, default_chapter=chapter)
+            if key not in candidates:
+                candidates[key] = payload
+        return candidates
+
+    def _collect_backfill_relationship_candidates(
+        self,
+        *,
+        from_chapter: Optional[int] = None,
+        to_chapter: Optional[int] = None,
+    ) -> Dict[tuple[str, str, str, int], Dict[str, Any]]:
+        candidates: Dict[tuple[str, str, str, int], Dict[str, Any]] = {}
+        for raw in self._state.get("structured_relationships", []) or []:
+            if not isinstance(raw, dict):
+                continue
+            chapter = self._to_int(raw.get("chapter"), default=0)
+            if chapter > 0 and not self._is_chapter_in_backfill_range(chapter, from_chapter, to_chapter):
+                continue
+            if chapter <= 0 and (from_chapter is not None or to_chapter is not None):
+                continue
+
+            payload = {
+                "from_entity": str(raw.get("from") or raw.get("from_entity") or "").strip(),
+                "to_entity": str(raw.get("to") or raw.get("to_entity") or "").strip(),
+                "type": str(raw.get("type") or "关联").strip() or "关联",
+                "description": str(raw.get("description") or "").strip(),
+                "chapter": int(chapter),
+                "sources": ["state.structured_relationships"],
+            }
+            if not payload["from_entity"] or not payload["to_entity"]:
+                continue
+
+            key = self._normalize_relationship_key(payload, default_chapter=chapter)
+            if key not in candidates:
+                candidates[key] = payload
+        return candidates
+
+    def _collect_backfill_appearance_candidates(
+        self,
+        index_manager,
+        *,
+        entity_candidates: Dict[str, Dict[str, Any]],
+        alias_candidates: Dict[tuple[str, str, str], Dict[str, Any]],
+        state_change_candidates: Dict[tuple[str, str, str, str, int], Dict[str, Any]],
+        relationship_candidates: Dict[tuple[str, str, str, int], Dict[str, Any]],
+        from_chapter: Optional[int] = None,
+        to_chapter: Optional[int] = None,
+    ) -> Dict[tuple[str, int], Dict[str, Any]]:
+        entity_records: Dict[str, Dict[str, str]] = {}
+        alias_to_ids: Dict[str, set[str]] = {}
+        canonical_to_ids: Dict[str, set[str]] = {}
+
+        try:
+            with index_manager._get_conn() as conn:
+                rows = conn.execute("SELECT id, type, canonical_name FROM entities").fetchall()
+                for row in rows:
+                    entity_id = str(row[0] or "").strip()
+                    if not entity_id:
+                        continue
+                    entity_type = str(row[1] or "").strip() or "角色"
+                    canonical_name = str(row[2] or "").strip()
+                    entity_records[entity_id] = {
+                        "id": entity_id,
+                        "type": entity_type,
+                        "canonical_name": canonical_name,
+                    }
+                    if canonical_name:
+                        canonical_to_ids.setdefault(canonical_name, set()).add(entity_id)
+
+                rows = conn.execute("SELECT alias, entity_id FROM aliases").fetchall()
+                for row in rows:
+                    alias = str(row[0] or "").strip()
+                    entity_id = str(row[1] or "").strip()
+                    if alias and entity_id:
+                        alias_to_ids.setdefault(alias, set()).add(entity_id)
+        except Exception:
+            pass
+
+        for entity_id, item in entity_candidates.items():
+            entity_id = str(entity_id or "").strip()
+            if not entity_id:
+                continue
+            record = entity_records.setdefault(
+                entity_id,
+                {
+                    "id": entity_id,
+                    "type": str(item.get("type") or "角色").strip() or "角色",
+                    "canonical_name": str(item.get("canonical_name") or "").strip(),
+                },
+            )
+            canonical_name = str(record.get("canonical_name") or item.get("canonical_name") or "").strip()
+            record["canonical_name"] = canonical_name
+            if canonical_name:
+                canonical_to_ids.setdefault(canonical_name, set()).add(entity_id)
+
+        for item in alias_candidates.values():
+            alias = str(item.get("alias") or "").strip()
+            entity_id = str(item.get("entity_id") or "").strip()
+            if alias and entity_id:
+                alias_to_ids.setdefault(alias, set()).add(entity_id)
+
+        appearance_candidates: Dict[tuple[str, int], Dict[str, Any]] = {}
+
+        def _resolve_entity_id(raw: Any) -> tuple[str, str]:
+            token = str(raw or "").strip()
+            if not token:
+                return "", ""
+            if token in entity_records:
+                return token, "id"
+            alias_ids = sorted(alias_to_ids.get(token, set()))
+            if len(alias_ids) == 1:
+                return alias_ids[0], "alias"
+            canonical_ids = sorted(canonical_to_ids.get(token, set()))
+            if len(canonical_ids) == 1:
+                return canonical_ids[0], "canonical_name"
+            return "", ""
+
+        def _add(entity_id: str, chapter: int, mention: str, confidence: float, source: str) -> None:
+            entity_id = str(entity_id or "").strip()
+            mention = str(mention or "").strip()
+            if not entity_id or not self._is_chapter_in_backfill_range(chapter, from_chapter, to_chapter):
+                return
+            key = (entity_id, int(chapter))
+            item = appearance_candidates.get(key)
+            if item is None:
+                item = {
+                    "entity_id": entity_id,
+                    "chapter": int(chapter),
+                    "mentions": set(),
+                    "confidence": 0.0,
+                    "sources": set(),
+                }
+                appearance_candidates[key] = item
+            if mention:
+                item["mentions"].add(mention)
+            item["confidence"] = max(float(item["confidence"]), float(confidence))
+            item["sources"].add(source)
+
+        chapter_signals: Dict[int, List[str]] = {}
+        try:
+            with index_manager._get_conn() as conn:
+                rows = conn.execute("SELECT chapter, characters FROM chapters").fetchall()
+                for row in rows:
+                    chapter = self._to_int(row[0], default=0)
+                    if not self._is_chapter_in_backfill_range(chapter, from_chapter, to_chapter):
+                        continue
+                    raw_chars = row[1]
+                    parsed_chars: List[str] = []
+                    if isinstance(raw_chars, str):
+                        try:
+                            data = json.loads(raw_chars)
+                            if isinstance(data, list):
+                                parsed_chars = [str(v).strip() for v in data if str(v).strip()]
+                            else:
+                                parsed_chars = self._coerce_string_list(raw_chars)
+                        except json.JSONDecodeError:
+                            parsed_chars = self._coerce_string_list(raw_chars)
+                    elif isinstance(raw_chars, list):
+                        parsed_chars = [str(v).strip() for v in raw_chars if str(v).strip()]
+                    if parsed_chars:
+                        chapter_signals.setdefault(chapter, []).extend(parsed_chars)
+        except Exception:
+            pass
+
+        chapter_meta = self._state.get("chapter_meta", {})
+        if isinstance(chapter_meta, dict):
+            for raw_key, raw_value in chapter_meta.items():
+                if not isinstance(raw_value, dict):
+                    continue
+                chapter = self._to_int(raw_key, default=0)
+                if not self._is_chapter_in_backfill_range(chapter, from_chapter, to_chapter):
+                    continue
+                chars = self._coerce_string_list(raw_value.get("characters"))
+                if chars:
+                    chapter_signals.setdefault(chapter, []).extend(chars)
+
+        for chapter, mentions in chapter_signals.items():
+            for mention in mentions:
+                entity_id, mode = _resolve_entity_id(mention)
+                if not entity_id:
+                    continue
+                confidence = 0.95 if mode == "id" else (0.72 if mode == "alias" else 0.66)
+                _add(entity_id, chapter, mention, confidence, "chapter.characters")
+
+        for item in state_change_candidates.values():
+            chapter = self._to_int(item.get("chapter"), default=0)
+            entity_id = str(item.get("entity_id") or "").strip()
+            if entity_id in entity_records:
+                _add(entity_id, chapter, entity_id, 0.55, "state.state_changes")
+
+        for item in relationship_candidates.values():
+            chapter = self._to_int(item.get("chapter"), default=0)
+            for entity_id in (
+                str(item.get("from_entity") or "").strip(),
+                str(item.get("to_entity") or "").strip(),
+            ):
+                if entity_id in entity_records:
+                    _add(entity_id, chapter, entity_id, 0.5, "state.structured_relationships")
+
+        normalized: Dict[tuple[str, int], Dict[str, Any]] = {}
+        for key, item in appearance_candidates.items():
+            mentions = sorted(item.get("mentions") or [])
+            if not mentions:
+                mentions = [str(item.get("entity_id") or "").strip()]
+            normalized[key] = {
+                "entity_id": str(item.get("entity_id") or "").strip(),
+                "chapter": int(item.get("chapter") or 0),
+                "mentions": mentions,
+                "confidence": float(item.get("confidence") or 0.0),
+                "sources": sorted(item.get("sources") or []),
+            }
+        return normalized
+
     def backfill_missing_chapter_index(
         self,
         *,
@@ -1810,20 +2433,40 @@ class StateManager:
         to_chapter: Optional[int] = None,
         dry_run: bool = True,
         include_reading_power: bool = True,
+        only: Optional[List[str]] = None,
+        skip: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
-        回填 index.db 中缺失的 chapters 行（best-effort）。
+        回填 index.db 中缺失的结构化数据（best-effort）。
 
-        数据源（按可用性自动组合）：
-        - 正文章节文件（正文/）
-        - .webnovel/summaries/chNNNN.md
-        - state.json.chapter_meta
-        - SQLite appearances/scenes/chapter_reading_power
+        默认启用 domains:
+        - chapters
+        - reading_power
+        - entities
+        - aliases
+        - state_changes
+        - relationships
+        - appearances
         """
         try:
-            from .index_manager import IndexManager, ChapterMeta, ChapterReadingPowerMeta
+            from .index_manager import (
+                IndexManager,
+                ChapterMeta,
+                ChapterReadingPowerMeta,
+                EntityMeta,
+                StateChangeMeta,
+                RelationshipMeta,
+            )
         except Exception as exc:  # pragma: no cover
             raise RuntimeError(f"无法加载 index_manager: {exc}") from exc
+
+        selected_domains = self._normalize_backfill_domains(
+            only=only,
+            skip=skip,
+            include_reading_power=bool(include_reading_power),
+        )
+        enable_chapters = "chapters" in selected_domains
+        enable_reading_power = "reading_power" in selected_domains
 
         index_manager = self._sql_state_manager._index_manager if self._sql_state_manager else IndexManager(self.config)
 
@@ -1842,7 +2485,7 @@ class StateManager:
                     existing_chapters.add(chapter)
 
         existing_reading_power_chapters = set()
-        if include_reading_power:
+        if enable_reading_power:
             try:
                 with index_manager._get_conn() as conn:
                     for row in conn.execute("SELECT chapter FROM chapter_reading_power").fetchall():
@@ -1857,7 +2500,7 @@ class StateManager:
             "from_chapter": int(from_chapter) if from_chapter is not None else None,
             "to_chapter": int(to_chapter) if to_chapter is not None else None,
             "candidates": len(ordered_chapters),
-            "include_reading_power": bool(include_reading_power),
+            "include_reading_power": bool(enable_reading_power),
             "already_present": 0,
             "missing": 0,
             "repaired": 0,
@@ -1865,8 +2508,9 @@ class StateManager:
             "repaired_chapters": [],
             "failed_items": [],
             "preview": [],
+            "domains_enabled": sorted(selected_domains),
             "reading_power": {
-                "enabled": bool(include_reading_power),
+                "enabled": bool(enable_reading_power),
                 "already_present": 0,
                 "missing": 0,
                 "repaired": 0,
@@ -1875,32 +2519,38 @@ class StateManager:
                 "failed_items": [],
                 "preview": [],
             },
+            "domains": {},
         }
+        for domain in self.BACKFILL_ALL_DOMAINS:
+            report["domains"][domain] = self._new_backfill_report_bucket(domain in selected_domains)
 
         for chapter in ordered_chapters:
             chapter_exists = chapter in existing_chapters
-            needs_reading_power = bool(include_reading_power) and chapter not in existing_reading_power_chapters
+            needs_chapter = bool(enable_chapters) and not chapter_exists
+            needs_reading_power = bool(enable_reading_power) and chapter not in existing_reading_power_chapters
 
-            if chapter_exists:
-                report["already_present"] += 1
-            else:
-                report["missing"] += 1
+            if enable_chapters:
+                if chapter_exists:
+                    report["already_present"] += 1
+                else:
+                    report["missing"] += 1
 
-            if include_reading_power:
+            if enable_reading_power:
                 if chapter in existing_reading_power_chapters:
                     report["reading_power"]["already_present"] += 1
                 else:
                     report["reading_power"]["missing"] += 1
 
-            if chapter_exists and not needs_reading_power:
+            if not needs_chapter and not needs_reading_power:
                 continue
 
-            payload = self._build_backfill_chapter_payload(
-                chapter,
-                candidates.get(chapter, set()),
-                index_manager,
-            )
-            if not chapter_exists:
+            payload: Optional[Dict[str, Any]] = None
+            if needs_chapter:
+                payload = self._build_backfill_chapter_payload(
+                    chapter,
+                    candidates.get(chapter, set()),
+                    index_manager,
+                )
                 report["preview"].append(
                     {
                         "chapter": int(payload["chapter"]),
@@ -1929,7 +2579,7 @@ class StateManager:
             if dry_run:
                 continue
 
-            if not chapter_exists:
+            if needs_chapter and payload is not None:
                 try:
                     index_manager.add_chapter(
                         ChapterMeta(
@@ -1971,6 +2621,399 @@ class StateManager:
                     report["reading_power"]["failed"] += 1
                     report["reading_power"]["failed_items"].append(
                         {"chapter": int(reading_payload["chapter"]), "error": str(exc)}
+                    )
+
+        report["domains"]["chapters"].update(
+            {
+                "already_present": int(report["already_present"]),
+                "missing": int(report["missing"]),
+                "repaired": int(report["repaired"]),
+                "failed": int(report["failed"]),
+                "preview": list(report["preview"]),
+                "failed_items": list(report["failed_items"]),
+                "repaired_items": [{"chapter": int(ch)} for ch in report.get("repaired_chapters", [])],
+            }
+        )
+        report["domains"]["chapters"]["repaired_chapters"] = list(report.get("repaired_chapters", []))
+
+        report["domains"]["reading_power"].update(
+            {
+                "already_present": int(report["reading_power"]["already_present"]),
+                "missing": int(report["reading_power"]["missing"]),
+                "repaired": int(report["reading_power"]["repaired"]),
+                "failed": int(report["reading_power"]["failed"]),
+                "preview": list(report["reading_power"]["preview"]),
+                "failed_items": list(report["reading_power"]["failed_items"]),
+                "repaired_items": [
+                    {"chapter": int(ch)} for ch in report["reading_power"].get("repaired_chapters", [])
+                ],
+            }
+        )
+        report["domains"]["reading_power"]["repaired_chapters"] = list(
+            report["reading_power"].get("repaired_chapters", [])
+        )
+
+        def _load_entity_ids() -> set[str]:
+            entity_ids: set[str] = set()
+            with index_manager._get_conn() as conn:
+                for row in conn.execute("SELECT id FROM entities").fetchall():
+                    entity_id = str(row[0] or "").strip()
+                    if entity_id:
+                        entity_ids.add(entity_id)
+            return entity_ids
+
+        entity_candidates: Dict[str, Dict[str, Any]] = {}
+        if {"entities", "aliases", "appearances"} & selected_domains:
+            entity_candidates = self._collect_backfill_entity_candidates(
+                from_chapter=from_chapter,
+                to_chapter=to_chapter,
+            )
+
+        alias_candidates: Dict[tuple[str, str, str], Dict[str, Any]] = {}
+        if {"aliases", "appearances"} & selected_domains:
+            alias_candidates = self._collect_backfill_alias_candidates(entity_candidates)
+
+        state_change_candidates: Dict[tuple[str, str, str, str, int], Dict[str, Any]] = {}
+        if {"state_changes", "appearances"} & selected_domains:
+            state_change_candidates = self._collect_backfill_state_change_candidates(
+                from_chapter=from_chapter,
+                to_chapter=to_chapter,
+            )
+
+        relationship_candidates: Dict[tuple[str, str, str, int], Dict[str, Any]] = {}
+        if {"relationships", "appearances"} & selected_domains:
+            relationship_candidates = self._collect_backfill_relationship_candidates(
+                from_chapter=from_chapter,
+                to_chapter=to_chapter,
+            )
+
+        if "entities" in selected_domains:
+            entity_bucket = report["domains"]["entities"]
+            existing_entities = _load_entity_ids()
+            for entity_id in sorted(entity_candidates.keys()):
+                item = entity_candidates[entity_id]
+                if entity_id in existing_entities:
+                    entity_bucket["already_present"] += 1
+                    continue
+                entity_bucket["missing"] += 1
+                entity_bucket["preview"].append(
+                    {
+                        "id": entity_id,
+                        "type": item.get("type"),
+                        "canonical_name": item.get("canonical_name"),
+                        "sources": list(item.get("sources") or []),
+                    }
+                )
+                if dry_run:
+                    continue
+                try:
+                    index_manager.upsert_entity(
+                        EntityMeta(
+                            id=entity_id,
+                            type=str(item.get("type") or "角色"),
+                            canonical_name=str(item.get("canonical_name") or entity_id),
+                            tier=str(item.get("tier") or "装饰"),
+                            desc=str(item.get("desc") or ""),
+                            current=dict(item.get("current") or {}),
+                            first_appearance=self._to_int(item.get("first_appearance"), default=0),
+                            last_appearance=self._to_int(item.get("last_appearance"), default=0),
+                            is_protagonist=bool(item.get("is_protagonist")),
+                        ),
+                        update_metadata=True,
+                    )
+                    entity_bucket["repaired"] += 1
+                    entity_bucket["repaired_items"].append({"id": entity_id})
+                    existing_entities.add(entity_id)
+                except Exception as exc:
+                    entity_bucket["failed"] += 1
+                    entity_bucket["failed_items"].append({"id": entity_id, "error": str(exc)})
+
+        if "aliases" in selected_domains:
+            alias_bucket = report["domains"]["aliases"]
+            existing_alias_keys: set[tuple[str, str, str]] = set()
+            try:
+                with index_manager._get_conn() as conn:
+                    for row in conn.execute("SELECT alias, entity_id, entity_type FROM aliases").fetchall():
+                        existing_alias_keys.add(
+                            (str(row[0] or "").strip(), str(row[1] or "").strip(), str(row[2] or "").strip())
+                        )
+            except sqlite3.OperationalError:
+                existing_alias_keys = set()
+
+            entity_ids = _load_entity_ids()
+            for key in sorted(alias_candidates.keys()):
+                item = alias_candidates[key]
+                alias = str(item.get("alias") or "").strip()
+                entity_id = str(item.get("entity_id") or "").strip()
+                entity_type = str(item.get("entity_type") or "角色").strip() or "角色"
+                normalized_key = (alias, entity_id, entity_type)
+                if normalized_key in existing_alias_keys:
+                    alias_bucket["already_present"] += 1
+                    continue
+                alias_bucket["missing"] += 1
+                alias_bucket["preview"].append(
+                    {
+                        "alias": alias,
+                        "entity_id": entity_id,
+                        "entity_type": entity_type,
+                        "sources": list(item.get("sources") or []),
+                    }
+                )
+                if dry_run:
+                    continue
+                if entity_id not in entity_ids:
+                    alias_bucket["failed"] += 1
+                    alias_bucket["failed_items"].append(
+                        {"alias": alias, "entity_id": entity_id, "error": "entity_not_found"}
+                    )
+                    continue
+                try:
+                    index_manager.register_alias(alias, entity_id, entity_type)
+                    alias_bucket["repaired"] += 1
+                    alias_bucket["repaired_items"].append({"alias": alias, "entity_id": entity_id})
+                    existing_alias_keys.add(normalized_key)
+                except Exception as exc:
+                    alias_bucket["failed"] += 1
+                    alias_bucket["failed_items"].append(
+                        {"alias": alias, "entity_id": entity_id, "error": str(exc)}
+                    )
+
+        if "state_changes" in selected_domains:
+            changes_bucket = report["domains"]["state_changes"]
+            existing_change_keys: set[tuple[str, str, str, str, int]] = set()
+            with index_manager._get_conn() as conn:
+                for row in conn.execute(
+                    "SELECT entity_id, field, old_value, new_value, chapter FROM state_changes"
+                ).fetchall():
+                    existing_change_keys.add(
+                        (
+                            str(row[0] or "").strip(),
+                            str(row[1] or "").strip(),
+                            str(row[2] or ""),
+                            str(row[3] or ""),
+                            self._to_int(row[4], default=0),
+                        )
+                    )
+
+            entity_ids = _load_entity_ids()
+            ordered_changes = sorted(
+                state_change_candidates.items(),
+                key=lambda kv: (
+                    int(kv[1].get("chapter") or 0),
+                    str(kv[1].get("entity_id") or ""),
+                    str(kv[1].get("field") or ""),
+                ),
+            )
+            for key, item in ordered_changes:
+                if key in existing_change_keys:
+                    changes_bucket["already_present"] += 1
+                    continue
+                entity_id = str(item.get("entity_id") or "").strip()
+                changes_bucket["missing"] += 1
+                changes_bucket["preview"].append(
+                    {
+                        "entity_id": entity_id,
+                        "field": item.get("field"),
+                        "chapter": int(item.get("chapter") or 0),
+                        "sources": list(item.get("sources") or []),
+                    }
+                )
+                if dry_run:
+                    continue
+                if entity_id not in entity_ids:
+                    changes_bucket["failed"] += 1
+                    changes_bucket["failed_items"].append(
+                        {"entity_id": entity_id, "chapter": item.get("chapter"), "error": "entity_not_found"}
+                    )
+                    continue
+                try:
+                    row_id = index_manager.record_state_change(
+                        StateChangeMeta(
+                            entity_id=entity_id,
+                            field=str(item.get("field") or ""),
+                            old_value=str(item.get("old_value") or ""),
+                            new_value=str(item.get("new_value") or ""),
+                            reason=str(item.get("reason") or ""),
+                            chapter=self._to_int(item.get("chapter"), default=0),
+                        )
+                    )
+                    if int(row_id or 0) > 0:
+                        changes_bucket["repaired"] += 1
+                        changes_bucket["repaired_items"].append(
+                            {"entity_id": entity_id, "chapter": int(item.get("chapter") or 0)}
+                        )
+                        existing_change_keys.add(key)
+                    else:
+                        changes_bucket["failed"] += 1
+                        changes_bucket["failed_items"].append(
+                            {"entity_id": entity_id, "chapter": item.get("chapter"), "error": "record_rejected"}
+                        )
+                except Exception as exc:
+                    changes_bucket["failed"] += 1
+                    changes_bucket["failed_items"].append(
+                        {"entity_id": entity_id, "chapter": item.get("chapter"), "error": str(exc)}
+                    )
+
+        if "relationships" in selected_domains:
+            rel_bucket = report["domains"]["relationships"]
+            existing_relationship_keys: set[tuple[str, str, str]] = set()
+            with index_manager._get_conn() as conn:
+                for row in conn.execute("SELECT from_entity, to_entity, type FROM relationships").fetchall():
+                    existing_relationship_keys.add(
+                        (
+                            str(row[0] or "").strip(),
+                            str(row[1] or "").strip(),
+                            str(row[2] or "").strip(),
+                        )
+                    )
+
+            entity_ids = _load_entity_ids()
+            ordered_relationships = sorted(
+                relationship_candidates.items(),
+                key=lambda kv: (
+                    int(kv[1].get("chapter") or 0),
+                    str(kv[1].get("from_entity") or ""),
+                    str(kv[1].get("to_entity") or ""),
+                    str(kv[1].get("type") or ""),
+                ),
+            )
+            for _, item in ordered_relationships:
+                from_entity = str(item.get("from_entity") or "").strip()
+                to_entity = str(item.get("to_entity") or "").strip()
+                rel_type = str(item.get("type") or "关联").strip() or "关联"
+                key = (from_entity, to_entity, rel_type)
+                if key in existing_relationship_keys:
+                    rel_bucket["already_present"] += 1
+                    continue
+                rel_bucket["missing"] += 1
+                rel_bucket["preview"].append(
+                    {
+                        "from_entity": from_entity,
+                        "to_entity": to_entity,
+                        "type": rel_type,
+                        "chapter": int(item.get("chapter") or 0),
+                        "sources": list(item.get("sources") or []),
+                    }
+                )
+                if dry_run:
+                    continue
+                if from_entity not in entity_ids or to_entity not in entity_ids:
+                    rel_bucket["failed"] += 1
+                    rel_bucket["failed_items"].append(
+                        {
+                            "from_entity": from_entity,
+                            "to_entity": to_entity,
+                            "type": rel_type,
+                            "error": "entity_not_found",
+                        }
+                    )
+                    continue
+                try:
+                    created = index_manager.upsert_relationship(
+                        RelationshipMeta(
+                            from_entity=from_entity,
+                            to_entity=to_entity,
+                            type=rel_type,
+                            description=str(item.get("description") or ""),
+                            chapter=int(item.get("chapter") or 0),
+                        )
+                    )
+                    if created:
+                        rel_bucket["repaired"] += 1
+                        rel_bucket["repaired_items"].append(
+                            {"from_entity": from_entity, "to_entity": to_entity, "type": rel_type}
+                        )
+                        existing_relationship_keys.add(key)
+                    else:
+                        existing = index_manager.get_relationship_between(from_entity, to_entity)
+                        if any(str(r.get("type") or "").strip() == rel_type for r in existing):
+                            rel_bucket["repaired"] += 1
+                            rel_bucket["repaired_items"].append(
+                                {"from_entity": from_entity, "to_entity": to_entity, "type": rel_type}
+                            )
+                            existing_relationship_keys.add(key)
+                        else:
+                            rel_bucket["failed"] += 1
+                            rel_bucket["failed_items"].append(
+                                {
+                                    "from_entity": from_entity,
+                                    "to_entity": to_entity,
+                                    "type": rel_type,
+                                    "error": "upsert_rejected",
+                                }
+                            )
+                except Exception as exc:
+                    rel_bucket["failed"] += 1
+                    rel_bucket["failed_items"].append(
+                        {"from_entity": from_entity, "to_entity": to_entity, "type": rel_type, "error": str(exc)}
+                    )
+
+        if "appearances" in selected_domains:
+            appearance_bucket = report["domains"]["appearances"]
+            appearance_candidates = self._collect_backfill_appearance_candidates(
+                index_manager,
+                entity_candidates=entity_candidates,
+                alias_candidates=alias_candidates,
+                state_change_candidates=state_change_candidates,
+                relationship_candidates=relationship_candidates,
+                from_chapter=from_chapter,
+                to_chapter=to_chapter,
+            )
+
+            existing_appearances: set[tuple[str, int]] = set()
+            with index_manager._get_conn() as conn:
+                for row in conn.execute("SELECT entity_id, chapter FROM appearances").fetchall():
+                    existing_appearances.add((str(row[0] or "").strip(), self._to_int(row[1], default=0)))
+
+            entity_ids = _load_entity_ids()
+            ordered_appearances = sorted(
+                appearance_candidates.items(),
+                key=lambda kv: (int(kv[1].get("chapter") or 0), str(kv[1].get("entity_id") or "")),
+            )
+            for key, item in ordered_appearances:
+                entity_id = str(item.get("entity_id") or "").strip()
+                chapter = self._to_int(item.get("chapter"), default=0)
+                if key in existing_appearances:
+                    appearance_bucket["already_present"] += 1
+                    continue
+                appearance_bucket["missing"] += 1
+                appearance_bucket["preview"].append(
+                    {
+                        "entity_id": entity_id,
+                        "chapter": chapter,
+                        "mentions": list(item.get("mentions") or []),
+                        "confidence": float(item.get("confidence") or 0.0),
+                        "sources": list(item.get("sources") or []),
+                    }
+                )
+                if dry_run:
+                    continue
+                if entity_id not in entity_ids:
+                    appearance_bucket["failed"] += 1
+                    appearance_bucket["failed_items"].append(
+                        {"entity_id": entity_id, "chapter": chapter, "error": "entity_not_found"}
+                    )
+                    continue
+                try:
+                    ok = index_manager.record_appearance(
+                        entity_id=entity_id,
+                        chapter=chapter,
+                        mentions=list(item.get("mentions") or []),
+                        confidence=float(item.get("confidence") or 0.0),
+                    )
+                    if ok:
+                        appearance_bucket["repaired"] += 1
+                        appearance_bucket["repaired_items"].append({"entity_id": entity_id, "chapter": chapter})
+                        existing_appearances.add((entity_id, chapter))
+                    else:
+                        appearance_bucket["failed"] += 1
+                        appearance_bucket["failed_items"].append(
+                            {"entity_id": entity_id, "chapter": chapter, "error": "record_rejected"}
+                        )
+                except Exception as exc:
+                    appearance_bucket["failed"] += 1
+                    appearance_bucket["failed_items"].append(
+                        {"entity_id": entity_id, "chapter": chapter, "error": str(exc)}
                     )
 
         return report
@@ -2329,7 +3372,7 @@ def main():
     process_parser.add_argument("--chapter", type=int, required=True, help="章节号")
     process_parser.add_argument("--data", required=True, help="JSON 格式的处理结果")
 
-    # 回填缺失章节索引
+    # 回填缺失结构化数据
     backfill_parser = subparsers.add_parser("backfill-missing")
     backfill_parser.add_argument("--from-chapter", type=int, help="起始章节（含）")
     backfill_parser.add_argument("--to-chapter", type=int, help="结束章节（含）")
@@ -2345,6 +3388,16 @@ def main():
         dest="include_reading_power",
         action="store_false",
         help="仅补 chapters，不处理 chapter_reading_power",
+    )
+    backfill_parser.add_argument(
+        "--only",
+        action="append",
+        help="仅回填指定数据域（可重复/逗号分隔）：chapters, reading_power, entities, aliases, state_changes, relationships, appearances",
+    )
+    backfill_parser.add_argument(
+        "--skip",
+        action="append",
+        help="跳过指定数据域（可重复/逗号分隔）",
     )
     backfill_parser.set_defaults(include_reading_power=True)
 
@@ -2470,6 +3523,8 @@ def main():
                 to_chapter=to_chapter,
                 dry_run=bool(args.dry_run),
                 include_reading_power=bool(args.include_reading_power),
+                only=list(args.only or []),
+                skip=list(args.skip or []),
             )
         except Exception as exc:
             emit_error(
