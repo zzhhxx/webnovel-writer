@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { memo, useState, useEffect, useCallback, useRef } from 'react'
 import { fetchJSON, subscribeSSE } from './api.js'
 import ForceGraph3D from 'react-force-graph-3d'
 
@@ -24,7 +24,7 @@ export default function App() {
 
     const scheduleRefresh = useCallback(() => {
         const now = Date.now()
-        const minIntervalMs = 800
+        const minIntervalMs = 1500
         const elapsed = now - lastRefreshAtRef.current
 
         if (elapsed >= minIntervalMs) {
@@ -45,10 +45,11 @@ export default function App() {
 
     // SSE 订阅
     useEffect(() => {
+        const refreshableFiles = new Set(['state.json', 'workflow_state.json'])
         const unsub = subscribeSSE(
             (evt) => {
-                // index.db-shm 在只读查询时也可能抖动，忽略它可避免无意义刷新。
-                if (evt?.file === 'index.db-shm') return
+                const file = String(evt?.file || '').toLowerCase()
+                if (!refreshableFiles.has(file)) return
                 scheduleRefresh()
             },
             {
@@ -94,12 +95,12 @@ export default function App() {
             </aside>
 
             <main className="main-content">
-                {page === 'dashboard' && <DashboardPage data={projectInfo} key={refreshKey} />}
-                {page === 'entities' && <EntitiesPage key={refreshKey} />}
-                {page === 'graph' && <GraphPage key={refreshKey} />}
-                {page === 'chapters' && <ChaptersPage key={refreshKey} />}
-                {page === 'files' && <FilesPage key={refreshKey} refreshKey={refreshKey} />}
-                {page === 'reading' && <ReadingPowerPage key={refreshKey} />}
+                {page === 'dashboard' && <DashboardPage data={projectInfo} />}
+                {page === 'entities' && <EntitiesPage refreshSignal={refreshKey} />}
+                {page === 'graph' && <GraphPage />}
+                {page === 'chapters' && <ChaptersPage refreshSignal={refreshKey} />}
+                {page === 'files' && <FilesPage refreshSignal={refreshKey} />}
+                {page === 'reading' && <ReadingPowerPage refreshSignal={refreshKey} />}
             </main>
         </div>
     )
@@ -140,6 +141,8 @@ const FULL_DATA_DOMAINS = [
     { id: 'quality', label: '质量审查' },
     { id: 'ops', label: 'RAG 与工具' },
 ]
+
+const PARTICLE_SPEED = () => 0.006
 
 
 // ====================================================================
@@ -267,7 +270,7 @@ function DashboardPage({ data }) {
 // 页面 2：设定词典
 // ====================================================================
 
-function EntitiesPage() {
+function EntitiesPage({ refreshSignal }) {
     const [entities, setEntities] = useState([])
     const [typeFilter, setTypeFilter] = useState('')
     const [selected, setSelected] = useState(null)
@@ -275,13 +278,13 @@ function EntitiesPage() {
 
     useEffect(() => {
         fetchJSON('/api/entities').then(setEntities).catch(() => { })
-    }, [])
+    }, [refreshSignal])
 
     useEffect(() => {
         if (selected) {
             fetchJSON('/api/state-changes', { entity: selected.id, limit: 30 }).then(setChanges).catch(() => setChanges([]))
         }
-    }, [selected])
+    }, [selected, refreshSignal])
 
     const types = [...new Set(entities.map(e => e.type))].sort()
     const filteredEntities = typeFilter ? entities.filter(e => e.type === typeFilter) : entities
@@ -383,7 +386,7 @@ function EntitiesPage() {
 // 页面 3：3D 宇宙关系图谱
 // ====================================================================
 
-function GraphPage() {
+const GraphPage = memo(function GraphPage() {
     const [relationships, setRelationships] = useState([])
     const [graphData, setGraphData] = useState({ nodes: [], links: [] })
 
@@ -445,14 +448,14 @@ function GraphPage() {
                     linkWidth={1}
                     linkDirectionalParticles={2}
                     linkDirectionalParticleWidth={1.5}
-                    linkDirectionalParticleSpeed={d => 0.005 + Math.random() * 0.005}
+                    linkDirectionalParticleSpeed={PARTICLE_SPEED}
                     backgroundColor="#fffaf0"
                     showNavInfo={false}
                 />
             </div>
         </>
     )
-}
+})
 
 function buildEffectiveRelationships(relationships, events) {
     const index = new Map()
@@ -512,12 +515,12 @@ function buildEffectiveRelationships(relationships, events) {
 // 页面 4：章节一览
 // ====================================================================
 
-function ChaptersPage() {
+function ChaptersPage({ refreshSignal }) {
     const [chapters, setChapters] = useState([])
 
     useEffect(() => {
         fetchJSON('/api/chapters').then(setChapters).catch(() => { })
-    }, [])
+    }, [refreshSignal])
 
     const totalWords = chapters.reduce((s, c) => s + (c.word_count || 0), 0)
 
@@ -555,14 +558,14 @@ function ChaptersPage() {
 // 页面 5：文档浏览
 // ====================================================================
 
-function FilesPage({ refreshKey }) {
+function FilesPage({ refreshSignal }) {
     const [tree, setTree] = useState({})
     const [selectedPath, setSelectedPath] = useState(null)
     const [content, setContent] = useState('')
 
     useEffect(() => {
         fetchJSON('/api/files/tree').then(setTree).catch(() => { })
-    }, [refreshKey])
+    }, [refreshSignal])
 
     useEffect(() => {
         if (selectedPath) {
@@ -570,7 +573,7 @@ function FilesPage({ refreshKey }) {
                 .then(d => setContent(d.content))
                 .catch(() => setContent('[读取失败]'))
         }
-    }, [selectedPath, refreshKey])
+    }, [selectedPath, refreshSignal])
 
     useEffect(() => {
         if (selectedPath) return
@@ -614,12 +617,12 @@ function FilesPage({ refreshKey }) {
 // 页面 6：追读力
 // ====================================================================
 
-function ReadingPowerPage() {
+function ReadingPowerPage({ refreshSignal }) {
     const [data, setData] = useState([])
 
     useEffect(() => {
         fetchJSON('/api/reading-power', { limit: 50 }).then(setData).catch(() => { })
-    }, [])
+    }, [refreshSignal])
 
     return (
         <>
@@ -681,7 +684,7 @@ function walkFirstFile(items) {
 // 数据总览内嵌：全量数据视图
 // ====================================================================
 
-function MergedDataView() {
+const MergedDataView = memo(function MergedDataView() {
     const [loading, setLoading] = useState(true)
     const [payload, setPayload] = useState({})
     const [domain, setDomain] = useState('overview')
@@ -827,7 +830,7 @@ function MergedDataView() {
             })}
         </>
     )
-}
+})
 
 function MiniTable({ rows, columns, pageSize = 12 }) {
     const [page, setPage] = useState(1)

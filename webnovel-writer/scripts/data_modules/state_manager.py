@@ -1353,6 +1353,117 @@ class StateManager:
         except (TypeError, ValueError):
             return default
 
+    @staticmethod
+    def _to_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in {"1", "true", "yes", "y", "on", "是", "真"}:
+                return True
+            if text in {"0", "false", "no", "n", "off", "否", "假"}:
+                return False
+        return bool(default)
+
+    @staticmethod
+    def _coerce_string_list(raw: Any) -> List[str]:
+        if raw is None:
+            return []
+
+        values: List[str] = []
+        if isinstance(raw, list):
+            values = [str(item).strip() for item in raw]
+        elif isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                return []
+            if text.startswith("[") and text.endswith("]"):
+                try:
+                    parsed = json.loads(text)
+                    if isinstance(parsed, list):
+                        values = [str(item).strip() for item in parsed]
+                    else:
+                        values = [text]
+                except json.JSONDecodeError:
+                    values = [part.strip() for part in re.split(r"[、,，/|+；;。]+", text)]
+            else:
+                values = [part.strip() for part in re.split(r"[、,，/|+；;。]+", text)]
+        else:
+            return []
+
+        deduped: List[str] = []
+        seen = set()
+        for item in values:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            deduped.append(item)
+        return deduped
+
+    @staticmethod
+    def _normalize_hook_strength(raw: Any) -> str:
+        text = str(raw or "").strip().lower()
+        if not text:
+            return "medium"
+        if text in {"strong", "high", "强", "强钩", "强烈"}:
+            return "strong"
+        if text in {"weak", "low", "弱", "偏弱"}:
+            return "weak"
+        return "medium"
+
+    @staticmethod
+    def _extract_hook_type_and_strength(*candidates: Any) -> tuple[str, Optional[str]]:
+        """
+        统一解析 hook 字段：
+        - 支持字符串："悬念钩"
+        - 支持对象：{"type": "...", "strength": "...", "content": "..."}
+        """
+        for value in candidates:
+            if value is None:
+                continue
+            if isinstance(value, dict):
+                hook_type = str(
+                    value.get("type")
+                    or value.get("hook_type")
+                    or value.get("name")
+                    or value.get("kind")
+                    or value.get("label")
+                    or ""
+                ).strip()
+                strength = str(
+                    value.get("strength")
+                    or value.get("hook_strength")
+                    or value.get("level")
+                    or ""
+                ).strip()
+                if hook_type or strength:
+                    return hook_type, (strength or None)
+            else:
+                text = str(value).strip()
+                if text:
+                    return text, None
+        return "", None
+
+    def _resolve_chapter_meta_entry(self, chapter: int) -> Dict[str, Any]:
+        chapter_meta: Dict[str, Any] = {}
+        raw_chapter_meta = self._state.get("chapter_meta", {})
+        if isinstance(raw_chapter_meta, dict):
+            for key in (str(int(chapter)).zfill(4), str(int(chapter))):
+                value = raw_chapter_meta.get(key)
+                if isinstance(value, dict):
+                    chapter_meta = value
+                    break
+            if not chapter_meta:
+                for raw_key, raw_value in raw_chapter_meta.items():
+                    if not isinstance(raw_value, dict):
+                        continue
+                    if self._to_int(raw_key, default=0) == int(chapter):
+                        chapter_meta = raw_value
+                        break
+        return chapter_meta
+
     def _extract_chapter_word_count(self, result: Dict[str, Any]) -> int:
         """从 Data Agent 结果中提取章节字数（缺失时返回 0）。"""
         chapter_info = result.get("chapter_info")
@@ -1607,12 +1718,98 @@ class StateManager:
             "summary": summary,
         }
 
+    def _build_backfill_reading_power_payload(self, chapter: int) -> Dict[str, Any]:
+        chapter_meta = self._resolve_chapter_meta_entry(int(chapter))
+
+        def _first_list(*keys: str) -> List[str]:
+            for key in keys:
+                values = self._coerce_string_list(chapter_meta.get(key))
+                if values:
+                    return values
+            return []
+
+        hook_type, hook_strength_from_hook = self._extract_hook_type_and_strength(
+            chapter_meta.get("hook_type"),
+            chapter_meta.get("hook"),
+            chapter_meta.get("ending_hook"),
+            chapter_meta.get("end_hook"),
+        )
+
+        hook_strength = self._normalize_hook_strength(
+            chapter_meta.get("hook_strength")
+            or chapter_meta.get("strength")
+            or chapter_meta.get("hook_level")
+            or hook_strength_from_hook
+        )
+
+        coolpoint_patterns = _first_list(
+            "coolpoint_patterns",
+            "coolpoint_pattern",
+            "cool_point_patterns",
+            "cool_point_pattern",
+            "patterns",
+            "pattern",
+        )
+        micropayoffs = _first_list(
+            "micropayoffs",
+            "micropayoff",
+            "micro_payoffs",
+            "micro_payoff",
+            "payoffs",
+            "payoff",
+        )
+        hard_violations = _first_list(
+            "hard_violations",
+            "hard_violation",
+            "hard_constraints",
+            "hard_constraint",
+        )
+        soft_suggestions = _first_list(
+            "soft_suggestions",
+            "soft_suggestion",
+            "soft_constraints",
+            "soft_constraint",
+        )
+
+        is_transition = self._to_bool(chapter_meta.get("is_transition"), default=False)
+        if not is_transition:
+            chapter_type = str(chapter_meta.get("chapter_type") or chapter_meta.get("type") or "").strip().lower()
+            is_transition = chapter_type in {"transition", "transitional", "过渡", "过渡章"}
+
+        override_count = max(0, self._to_int(chapter_meta.get("override_count"), default=0))
+        debt_balance = max(0.0, self._to_float(chapter_meta.get("debt_balance"), default=0.0))
+
+        has_signal = bool(
+            hook_type
+            or coolpoint_patterns
+            or micropayoffs
+            or hard_violations
+            or soft_suggestions
+            or chapter_meta.get("hook_strength") is not None
+            or chapter_meta.get("is_transition") is not None
+        )
+
+        return {
+            "chapter": int(chapter),
+            "hook_type": hook_type,
+            "hook_strength": hook_strength,
+            "coolpoint_patterns": coolpoint_patterns,
+            "micropayoffs": micropayoffs,
+            "hard_violations": hard_violations,
+            "soft_suggestions": soft_suggestions,
+            "is_transition": bool(is_transition),
+            "override_count": int(override_count),
+            "debt_balance": float(debt_balance),
+            "has_signal": has_signal,
+        }
+
     def backfill_missing_chapter_index(
         self,
         *,
         from_chapter: Optional[int] = None,
         to_chapter: Optional[int] = None,
         dry_run: bool = True,
+        include_reading_power: bool = True,
     ) -> Dict[str, Any]:
         """
         回填 index.db 中缺失的 chapters 行（best-effort）。
@@ -1624,7 +1821,7 @@ class StateManager:
         - SQLite appearances/scenes/chapter_reading_power
         """
         try:
-            from .index_manager import IndexManager, ChapterMeta
+            from .index_manager import IndexManager, ChapterMeta, ChapterReadingPowerMeta
         except Exception as exc:  # pragma: no cover
             raise RuntimeError(f"无法加载 index_manager: {exc}") from exc
 
@@ -1644,11 +1841,23 @@ class StateManager:
                 if chapter > 0:
                     existing_chapters.add(chapter)
 
+        existing_reading_power_chapters = set()
+        if include_reading_power:
+            try:
+                with index_manager._get_conn() as conn:
+                    for row in conn.execute("SELECT chapter FROM chapter_reading_power").fetchall():
+                        chapter = self._to_int(row[0], default=0)
+                        if chapter > 0:
+                            existing_reading_power_chapters.add(chapter)
+            except sqlite3.OperationalError:
+                existing_reading_power_chapters = set()
+
         report: Dict[str, Any] = {
             "dry_run": bool(dry_run),
             "from_chapter": int(from_chapter) if from_chapter is not None else None,
             "to_chapter": int(to_chapter) if to_chapter is not None else None,
             "candidates": len(ordered_chapters),
+            "include_reading_power": bool(include_reading_power),
             "already_present": 0,
             "missing": 0,
             "repaired": 0,
@@ -1656,47 +1865,113 @@ class StateManager:
             "repaired_chapters": [],
             "failed_items": [],
             "preview": [],
+            "reading_power": {
+                "enabled": bool(include_reading_power),
+                "already_present": 0,
+                "missing": 0,
+                "repaired": 0,
+                "failed": 0,
+                "repaired_chapters": [],
+                "failed_items": [],
+                "preview": [],
+            },
         }
 
         for chapter in ordered_chapters:
-            if chapter in existing_chapters:
+            chapter_exists = chapter in existing_chapters
+            needs_reading_power = bool(include_reading_power) and chapter not in existing_reading_power_chapters
+
+            if chapter_exists:
                 report["already_present"] += 1
+            else:
+                report["missing"] += 1
+
+            if include_reading_power:
+                if chapter in existing_reading_power_chapters:
+                    report["reading_power"]["already_present"] += 1
+                else:
+                    report["reading_power"]["missing"] += 1
+
+            if chapter_exists and not needs_reading_power:
                 continue
 
-            report["missing"] += 1
-            payload = self._build_backfill_chapter_payload(chapter, candidates.get(chapter, set()), index_manager)
-            report["preview"].append(
-                {
-                    "chapter": int(payload["chapter"]),
-                    "sources": list(payload["sources"]),
-                    "title": payload["title"],
-                    "word_count": int(payload["word_count"]),
-                    "characters": list(payload["characters"]),
-                    "has_summary": bool(payload["summary"]),
-                }
+            payload = self._build_backfill_chapter_payload(
+                chapter,
+                candidates.get(chapter, set()),
+                index_manager,
             )
+            if not chapter_exists:
+                report["preview"].append(
+                    {
+                        "chapter": int(payload["chapter"]),
+                        "sources": list(payload["sources"]),
+                        "title": payload["title"],
+                        "word_count": int(payload["word_count"]),
+                        "characters": list(payload["characters"]),
+                        "has_summary": bool(payload["summary"]),
+                    }
+                )
+
+            reading_payload: Optional[Dict[str, Any]] = None
+            if needs_reading_power:
+                reading_payload = self._build_backfill_reading_power_payload(chapter)
+                report["reading_power"]["preview"].append(
+                    {
+                        "chapter": int(reading_payload["chapter"]),
+                        "hook_type": str(reading_payload["hook_type"]),
+                        "hook_strength": str(reading_payload["hook_strength"]),
+                        "patterns": list(reading_payload["coolpoint_patterns"]),
+                        "is_transition": bool(reading_payload["is_transition"]),
+                        "has_signal": bool(reading_payload["has_signal"]),
+                    }
+                )
 
             if dry_run:
                 continue
 
-            try:
-                index_manager.add_chapter(
-                    ChapterMeta(
-                        chapter=int(payload["chapter"]),
-                        title=str(payload["title"]),
-                        location=str(payload["location"]),
-                        word_count=max(0, int(payload["word_count"])),
-                        characters=list(payload["characters"]),
-                        summary=str(payload["summary"]),
+            if not chapter_exists:
+                try:
+                    index_manager.add_chapter(
+                        ChapterMeta(
+                            chapter=int(payload["chapter"]),
+                            title=str(payload["title"]),
+                            location=str(payload["location"]),
+                            word_count=max(0, int(payload["word_count"])),
+                            characters=list(payload["characters"]),
+                            summary=str(payload["summary"]),
+                        )
                     )
-                )
-                report["repaired"] += 1
-                report["repaired_chapters"].append(int(payload["chapter"]))
-            except Exception as exc:
-                report["failed"] += 1
-                report["failed_items"].append(
-                    {"chapter": int(payload["chapter"]), "error": str(exc)}
-                )
+                    report["repaired"] += 1
+                    report["repaired_chapters"].append(int(payload["chapter"]))
+                except Exception as exc:
+                    report["failed"] += 1
+                    report["failed_items"].append(
+                        {"chapter": int(payload["chapter"]), "error": str(exc)}
+                    )
+
+            if needs_reading_power and reading_payload is not None:
+                try:
+                    index_manager.save_chapter_reading_power(
+                        ChapterReadingPowerMeta(
+                            chapter=int(reading_payload["chapter"]),
+                            hook_type=str(reading_payload["hook_type"]),
+                            hook_strength=str(reading_payload["hook_strength"]),
+                            coolpoint_patterns=list(reading_payload["coolpoint_patterns"]),
+                            micropayoffs=list(reading_payload["micropayoffs"]),
+                            hard_violations=list(reading_payload["hard_violations"]),
+                            soft_suggestions=list(reading_payload["soft_suggestions"]),
+                            is_transition=bool(reading_payload["is_transition"]),
+                            override_count=int(reading_payload["override_count"]),
+                            debt_balance=float(reading_payload["debt_balance"]),
+                        )
+                    )
+                    report["reading_power"]["repaired"] += 1
+                    report["reading_power"]["repaired_chapters"].append(int(reading_payload["chapter"]))
+                except Exception as exc:
+                    report["reading_power"]["failed"] += 1
+                    report["reading_power"]["failed_items"].append(
+                        {"chapter": int(reading_payload["chapter"]), "error": str(exc)}
+                    )
 
         return report
 
@@ -2059,6 +2334,19 @@ def main():
     backfill_parser.add_argument("--from-chapter", type=int, help="起始章节（含）")
     backfill_parser.add_argument("--to-chapter", type=int, help="结束章节（含）")
     backfill_parser.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
+    backfill_parser.add_argument(
+        "--include-reading-power",
+        dest="include_reading_power",
+        action="store_true",
+        help="同时补齐 chapter_reading_power（默认开启）",
+    )
+    backfill_parser.add_argument(
+        "--no-reading-power",
+        dest="include_reading_power",
+        action="store_false",
+        help="仅补 chapters，不处理 chapter_reading_power",
+    )
+    backfill_parser.set_defaults(include_reading_power=True)
 
     argv = normalize_global_project_root(sys.argv[1:])
     args = parser.parse_args(argv)
@@ -2181,6 +2469,7 @@ def main():
                 from_chapter=from_chapter,
                 to_chapter=to_chapter,
                 dry_run=bool(args.dry_run),
+                include_reading_power=bool(args.include_reading_power),
             )
         except Exception as exc:
             emit_error(

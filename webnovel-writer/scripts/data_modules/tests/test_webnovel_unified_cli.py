@@ -137,6 +137,51 @@ def test_backfill_missing_forwards_to_state_manager(monkeypatch, tmp_path):
     ]
 
 
+def test_backfill_missing_forwards_no_reading_power_flag(monkeypatch, tmp_path):
+    module = _load_webnovel_module()
+
+    book_root = (tmp_path / "book").resolve()
+    called = {}
+
+    def _fake_resolve(explicit_project_root=None):
+        return book_root
+
+    def _fake_run_data_module(module_name, argv):
+        called["module_name"] = module_name
+        called["argv"] = list(argv)
+        return 0
+
+    monkeypatch.setattr(module, "_resolve_root", _fake_resolve)
+    monkeypatch.setattr(module, "_run_data_module", _fake_run_data_module)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "webnovel",
+            "--project-root",
+            str(tmp_path),
+            "backfill-missing",
+            "--no-reading-power",
+            "--to-chapter",
+            "20",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        module.main()
+
+    assert int(exc.value.code or 0) == 0
+    assert called["module_name"] == "state_manager"
+    assert called["argv"] == [
+        "--project-root",
+        str(book_root),
+        "backfill-missing",
+        "--to-chapter",
+        "20",
+        "--no-reading-power",
+    ]
+
+
 def test_preflight_succeeds_for_valid_project_root(monkeypatch, tmp_path, capsys):
     module = _load_webnovel_module()
 

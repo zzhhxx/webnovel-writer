@@ -682,6 +682,11 @@ def test_state_manager_cli_backfill_missing(temp_project, monkeypatch, capsys):
     assert dry_run.get("data", {}).get("dry_run") is True
     assert dry_run.get("data", {}).get("missing", 0) >= 1
     assert any(item.get("chapter") == 1 for item in dry_run.get("data", {}).get("preview", []))
+    assert dry_run.get("data", {}).get("reading_power", {}).get("enabled") is True
+    assert any(
+        item.get("chapter") == 1
+        for item in dry_run.get("data", {}).get("reading_power", {}).get("preview", [])
+    )
     assert idx.get_chapter(1) is None
 
     applied = run_cli(
@@ -701,6 +706,40 @@ def test_state_manager_cli_backfill_missing(temp_project, monkeypatch, capsys):
     assert int(chapter.get("word_count") or 0) > 0
     assert "xiaoyan" in (chapter.get("characters") or [])
     assert chapter.get("summary", "").strip() != ""
+    reading_power = idx.get_chapter_reading_power(1)
+    assert reading_power is not None
+
+
+def test_state_manager_cli_backfill_missing_without_reading_power(temp_project, monkeypatch, capsys):
+    chapter_file = temp_project.project_root / "正文" / "第0001章-测试标题.md"
+    chapter_file.parent.mkdir(parents=True, exist_ok=True)
+    chapter_file.write_text("# 第1章：测试标题\n\n正文内容", encoding="utf-8")
+
+    idx = IndexManager(temp_project)
+    assert idx.get_chapter_reading_power(1) is None
+
+    def run_cli(args):
+        monkeypatch.setattr(sys, "argv", args)
+        from data_modules import state_manager as sm
+
+        sm.main()
+        out = capsys.readouterr().out
+        return json.loads(out)
+
+    applied = run_cli(
+        [
+            "state_manager",
+            "--project-root",
+            str(temp_project.project_root),
+            "backfill-missing",
+            "--no-reading-power",
+        ]
+    )
+    assert applied["status"] == "success"
+    assert applied.get("data", {}).get("include_reading_power") is False
+    assert applied.get("data", {}).get("reading_power", {}).get("enabled") is False
+    assert idx.get_chapter(1) is not None
+    assert idx.get_chapter_reading_power(1) is None
 
 
 def test_state_manager_cli_backfill_invalid_range(temp_project, monkeypatch, capsys):

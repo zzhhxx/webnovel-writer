@@ -216,6 +216,19 @@ def main() -> None:
     p_backfill.add_argument("--from-chapter", type=int, help="起始章节（含）")
     p_backfill.add_argument("--to-chapter", type=int, help="结束章节（含）")
     p_backfill.add_argument("--dry-run", action="store_true", help="仅预览，不写入")
+    p_backfill.add_argument(
+        "--include-reading-power",
+        dest="include_reading_power",
+        action="store_true",
+        help="同时补齐 chapter_reading_power（默认开启）",
+    )
+    p_backfill.add_argument(
+        "--no-reading-power",
+        dest="include_reading_power",
+        action="store_false",
+        help="仅补 chapters，不处理 chapter_reading_power",
+    )
+    p_backfill.set_defaults(include_reading_power=True)
 
     p_rag = sub.add_parser("rag", help="转发到 rag_adapter")
     p_rag.add_argument("args", nargs=argparse.REMAINDER)
@@ -296,6 +309,8 @@ def main() -> None:
             backfill_args.extend(["--from-chapter", str(args.from_chapter)])
         if args.to_chapter is not None:
             backfill_args.extend(["--to-chapter", str(args.to_chapter)])
+        if not bool(args.include_reading_power):
+            backfill_args.append("--no-reading-power")
         raise SystemExit(_run_data_module("state_manager", backfill_args))
     if tool == "rag":
         raise SystemExit(_run_data_module("rag_adapter", [*forward_args, *rest]))

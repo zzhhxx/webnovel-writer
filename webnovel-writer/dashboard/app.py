@@ -108,14 +108,23 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
         return conn
 
     def _fetchall_safe(conn: sqlite3.Connection, query: str, params: tuple = ()) -> list[dict]:
-        """执行只读查询；若目标表不存在（旧库），返回空列表。"""
+        """执行只读查询；若旧 schema 缺表/缺列，返回空列表。"""
         try:
             rows = conn.execute(query, params).fetchall()
             return [dict(r) for r in rows]
         except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc).lower():
+            msg = str(exc).lower()
+            if "no such table" in msg or "no such column" in msg:
                 return []
             raise HTTPException(status_code=500, detail=f"数据库查询失败: {exc}") from exc
+
+    def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+        """读取表字段名；表不存在时返回空集合。"""
+        try:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        except sqlite3.OperationalError:
+            return set()
+        return {str(r["name"]) for r in rows if r["name"]}
 
     @app.get("/api/entities")
     def list_entities(
@@ -124,19 +133,22 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
     ):
         """列出所有实体（可按类型过滤）。"""
         with closing(_get_db()) as conn:
+            cols = _table_columns(conn, "entities")
+            if not cols:
+                return []
             q = "SELECT * FROM entities"
             params: list = []
             clauses: list[str] = []
-            if entity_type:
+            if entity_type and "type" in cols:
                 clauses.append("type = ?")
                 params.append(entity_type)
-            if not include_archived:
+            # 兼容旧 schema：早期实体表没有 is_archived 字段。
+            if not include_archived and "is_archived" in cols:
                 clauses.append("is_archived = 0")
             if clauses:
                 q += " WHERE " + " AND ".join(clauses)
-            q += " ORDER BY last_appearance DESC"
-            rows = conn.execute(q, params).fetchall()
-            return [dict(r) for r in rows]
+            q += " ORDER BY last_appearance DESC" if "last_appearance" in cols else " ORDER BY id ASC"
+            return _fetchall_safe(conn, q, tuple(params))
 
     @app.get("/api/entities/{entity_id}")
     def get_entity(entity_id: str):
@@ -150,16 +162,16 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
     def list_relationships(entity: Optional[str] = None, limit: int = 200):
         with closing(_get_db()) as conn:
             if entity:
-                rows = conn.execute(
+                return _fetchall_safe(
+                    conn,
                     "SELECT * FROM relationships WHERE from_entity = ? OR to_entity = ? ORDER BY chapter DESC LIMIT ?",
                     (entity, entity, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM relationships ORDER BY chapter DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-            return [dict(r) for r in rows]
+                )
+            return _fetchall_safe(
+                conn,
+                "SELECT * FROM relationships ORDER BY chapter DESC LIMIT ?",
+                (limit,),
+            )
 
     @app.get("/api/relationship-events")
     def list_relationship_events(
@@ -190,62 +202,63 @@ def create_app(project_root: str | Path | None = None) -> FastAPI:
     @app.get("/api/chapters")
     def list_chapters():
         with closing(_get_db()) as conn:
-            rows = conn.execute("SELECT * FROM chapters ORDER BY chapter ASC").fetchall()
-            return [dict(r) for r in rows]
+            return _fetchall_safe(conn, "SELECT * FROM chapters ORDER BY chapter ASC")
 
     @app.get("/api/scenes")
     def list_scenes(chapter: Optional[int] = None, limit: int = 500):
         with closing(_get_db()) as conn:
             if chapter is not None:
-                rows = conn.execute(
+                return _fetchall_safe(
+                    conn,
                     "SELECT * FROM scenes WHERE chapter = ? ORDER BY scene_index ASC", (chapter,)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM scenes ORDER BY chapter ASC, scene_index ASC LIMIT ?", (limit,)
-                ).fetchall()
-            return [dict(r) for r in rows]
+                )
+            return _fetchall_safe(
+                conn,
+                "SELECT * FROM scenes ORDER BY chapter ASC, scene_index ASC LIMIT ?",
+                (limit,),
+            )
 
     @app.get("/api/reading-power")
     def list_reading_power(limit: int = 50):
         with closing(_get_db()) as conn:
-            rows = conn.execute(
+            return _fetchall_safe(
+                conn,
                 "SELECT * FROM chapter_reading_power ORDER BY chapter DESC LIMIT ?", (limit,)
-            ).fetchall()
-            return [dict(r) for r in rows]
+            )
 
     @app.get("/api/review-metrics")
     def list_review_metrics(limit: int = 20):
         with closing(_get_db()) as conn:
-            rows = conn.execute(
+            return _fetchall_safe(
+                conn,
                 "SELECT * FROM review_metrics ORDER BY end_chapter DESC LIMIT ?", (limit,)
-            ).fetchall()
-            return [dict(r) for r in rows]
+            )
 
     @app.get("/api/state-changes")
     def list_state_changes(entity: Optional[str] = None, limit: int = 100):
         with closing(_get_db()) as conn:
             if entity:
-                rows = conn.execute(
+                return _fetchall_safe(
+                    conn,
                     "SELECT * FROM state_changes WHERE entity_id = ? ORDER BY chapter DESC LIMIT ?",
                     (entity, limit),
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM state_changes ORDER BY chapter DESC LIMIT ?", (limit,)
-                ).fetchall()
-            return [dict(r) for r in rows]
+                )
+            return _fetchall_safe(
+                conn,
+                "SELECT * FROM state_changes ORDER BY chapter DESC LIMIT ?",
+                (limit,),
+            )
 
     @app.get("/api/aliases")
     def list_aliases(entity: Optional[str] = None):
         with closing(_get_db()) as conn:
             if entity:
-                rows = conn.execute(
-                    "SELECT * FROM aliases WHERE entity_id = ?", (entity,)
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM aliases").fetchall()
-            return [dict(r) for r in rows]
+                return _fetchall_safe(
+                    conn,
+                    "SELECT * FROM aliases WHERE entity_id = ?",
+                    (entity,),
+                )
+            return _fetchall_safe(conn, "SELECT * FROM aliases")
 
     # ===========================================================
     # API：扩展表（v5.3+ / v5.4+）

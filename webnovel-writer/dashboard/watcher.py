@@ -42,13 +42,11 @@ class _WebnovelFileHandler(FileSystemEventHandler):
         name = file_path.name.lower()
         if name in self.WATCH_NAMES:
             return True
-        # SQLite WAL 模式写入通常落在 index.db-wal。
-        # 注意：index.db-shm 在只读查询时也可能频繁抖动，容易触发前端“刷新风暴”。
-        # 因此显式忽略 index.db-shm，仅监听 index.db 与 index.db-wal。
-        if name == f"{self.INDEX_DB_PREFIX}-shm":
+        # 不监听 index.db*：
+        # - dashboard 读查询本身可能引发 wal/shm 抖动，形成“自触发刷新回路”；
+        # - 前端改为基于 state/workflow 事件刷新，数据库明细在页面进入时按需拉取。
+        if name == self.INDEX_DB_PREFIX or name.startswith(f"{self.INDEX_DB_PREFIX}-"):
             return False
-        if name == self.INDEX_DB_PREFIX or name == f"{self.INDEX_DB_PREFIX}-wal":
-            return True
 
         resolved = file_path.resolve()
         # 递归监听 reports 目录，覆盖审查报告/趋势报告等文件变更
@@ -91,7 +89,7 @@ class FileWatcher:
         self._subscribers: list[asyncio.Queue] = []
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_dispatch_ts: float = 0.0
-        self._dispatch_min_interval_sec: float = 0.8
+        self._dispatch_min_interval_sec: float = 1.5
         self._pending_msg: str | None = None
         self._pending_handle: asyncio.Handle | None = None
 
