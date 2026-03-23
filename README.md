@@ -75,6 +75,12 @@ RERANK_API_KEY=your_rerank_api_key
 /webnovel-review 1-5
 ```
 
+如需补齐历史缺失落库（章节索引/追读力）：
+
+```bash
+/webnovel-backfill
+```
+
 如需排查本地 CLI / 插件目录 / 项目根解析问题，可直接运行统一预检：
 
 ```bash
@@ -118,7 +124,8 @@ model: sonnet
 
 | 版本 | 说明 |
 |------|------|
-| **v5.5.8 (当前)** | 修复 Dashboard 异常刷新与空白页；增强旧版 index.db 兼容；backfill-missing 支持补齐追读力并新增 --no-reading-power 开关。 |
+| **v5.5.9 (当前)** | 将数据补全加入命令 |
+| **v5.5.8** | 修复 Dashboard 异常刷新与空白页；增强旧版 index.db 兼容；backfill-missing 支持补齐追读力并新增 --no-reading-power 开关。 |
 | **v5.5.7** | 修复数据库刷新 |
 | **v5.5.6** | 修复数据库写入，以及补全前端所需数据 |
 | **v5.5.5** | 修复落库一致性、审查双写与前端刷新缺失 |

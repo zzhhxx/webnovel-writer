@@ -17,6 +17,7 @@
 | `/webnovel-write` | `webnovel-write` Skill | 写作流程 Step 5 数据链更新时 | Task 调 `data-agent`（内部再写 state/index） |
 | `/webnovel-query` | `webnovel-query` Skill | 查询“伏笔紧急度/Strand 节奏”等分析请求时 | `scripts/status_reporter.py --focus urgency/strand` |
 | `/webnovel-resume` | `webnovel-resume` Skill | 中断恢复检测、清理、断点恢复时 | `scripts/workflow_manager.py detect/cleanup/clear` |
+| `/webnovel-backfill` | `webnovel-backfill` Skill | 修复历史项目缺失的章节索引/追读力落库时 | `scripts/webnovel.py backfill-missing` |
 
 ## 脚本级矩阵（脚本 -> 谁触发 -> 什么时候）
 
